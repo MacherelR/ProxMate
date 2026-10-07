@@ -15,6 +15,17 @@ export interface SsoConfig {
   adminGroup: string; // membership in this group maps to the admin role ("" = off)
   allowSignup: boolean; // JIT-provision brand-new users (off = invite/link-only)
   buttonLabel: string; // login-button text, e.g. "Sign in with Keycloak"
+  /**
+   * Who may use THIS ProxMate: a non-admin login must carry at least one of these values
+   * in the groups/roles claim. Empty = no gate (everyone the IdP lets in, as before).
+   * This is what ties an instance to one environment: the Proxmox account it runs with
+   * bounds WHERE guests can go, this bounds WHO may create them.
+   */
+  accessRoles: string[];
+  /** Quota handed to a brand-new (JIT-provisioned) user. 0 = none, as before. */
+  newUserCpu: number;
+  newUserRam: number; // MB
+  newUserStorage: number; // GB
 }
 
 /** A normalized subset of the ID-token claims we actually consume. */
@@ -25,7 +36,11 @@ export interface SsoClaims {
   groups?: string[];
 }
 
-const DEFAULTS = { scopes: 'openid profile email', groupsClaim: 'groups', buttonLabel: 'Sign in with SSO' };
+const DEFAULTS = {
+  scopes: 'openid profile email',
+  groupsClaim: 'groups',
+  buttonLabel: 'Sign in with SSO',
+};
 
 /** The provider redirects back here; must be registered in the IdP. */
 export function callbackUrl(): string {
@@ -35,7 +50,20 @@ export function callbackUrl(): string {
 
 /** Read SSO settings (without the secret); null when no issuer is configured. */
 export async function getSsoConfig(): Promise<SsoConfig | null> {
-  const [issuer, clientId, enabled, scopes, groupsClaim, adminGroup, allowSignup, buttonLabel] = await Promise.all([
+  const [
+    issuer,
+    clientId,
+    enabled,
+    scopes,
+    groupsClaim,
+    adminGroup,
+    allowSignup,
+    buttonLabel,
+    accessRoles,
+    newUserCpu,
+    newUserRam,
+    newUserStorage,
+  ] = await Promise.all([
     getConfig('sso_issuer'),
     getConfig('sso_client_id'),
     getConfig('sso_enabled'),
@@ -44,6 +72,10 @@ export async function getSsoConfig(): Promise<SsoConfig | null> {
     getConfig('sso_admin_group'),
     getConfig('sso_allow_signup'),
     getConfig('sso_button_label'),
+    getConfig('sso_access_roles'),
+    getConfig('sso_new_user_cpu'),
+    getConfig('sso_new_user_ram'),
+    getConfig('sso_new_user_storage'),
   ]);
   if (!issuer || !clientId) return null;
   return {
@@ -55,7 +87,22 @@ export async function getSsoConfig(): Promise<SsoConfig | null> {
     adminGroup: adminGroup || '',
     allowSignup: allowSignup === 'true',
     buttonLabel: buttonLabel || DEFAULTS.buttonLabel,
+    accessRoles: parseRoleList(accessRoles),
+    newUserCpu: toQuota(newUserCpu),
+    newUserRam: toQuota(newUserRam),
+    newUserStorage: toQuota(newUserStorage),
   };
+}
+
+/** "a, b  c" → ['a','b','c'] — role names never contain spaces or commas. */
+export function parseRoleList(raw: string | null | undefined): string[] {
+  return [...new Set((raw ?? '').split(/[,\s]+/).filter(Boolean))];
+}
+
+/** A stored quota default → a non-negative integer (anything unparseable is 0 = none). */
+function toQuota(raw: string | null | undefined): number {
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : 0;
 }
 
 /** SSO is usable only when both configured AND enabled. */
@@ -81,6 +128,10 @@ export async function saveSsoConfig(data: {
   adminGroup?: string;
   allowSignup?: boolean;
   buttonLabel?: string;
+  accessRoles?: string;
+  newUserCpu?: number;
+  newUserRam?: number;
+  newUserStorage?: number;
 }): Promise<void> {
   await setConfig('sso_issuer', data.issuer.trim());
   await setConfig('sso_client_id', data.clientId.trim());
@@ -90,6 +141,10 @@ export async function saveSsoConfig(data: {
   await setConfig('sso_admin_group', data.adminGroup?.trim() ?? '');
   await setConfig('sso_allow_signup', String(data.allowSignup ?? false));
   await setConfig('sso_button_label', data.buttonLabel?.trim() || DEFAULTS.buttonLabel);
+  await setConfig('sso_access_roles', parseRoleList(data.accessRoles).join(','));
+  await setConfig('sso_new_user_cpu', String(data.newUserCpu ?? 0));
+  await setConfig('sso_new_user_ram', String(data.newUserRam ?? 0));
+  await setConfig('sso_new_user_storage', String(data.newUserStorage ?? 0));
   if (data.clientSecret && data.clientSecret.trim().length > 0) {
     await setConfig('sso_client_secret', data.clientSecret, true);
   }
@@ -189,6 +244,17 @@ export async function completeLogin(currentUrl: string, cookieValue: string): Pr
 
 // ─── Claims → local user (the testable core) ──────────────────
 
+/** Shown when the IdP authenticated the user but the token lacks every required role. */
+export const NO_ACCESS_MESSAGE =
+  'Your account has no access to this environment. Ask an administrator to grant you the required role.';
+
+/** True when no gate is configured, or the token carries at least one accepted value. */
+export function hasAccessRole(claims: SsoClaims, cfg: SsoConfig): boolean {
+  if (cfg.accessRoles.length === 0) return true;
+  const held = new Set(claims.groups ?? []);
+  return cfg.accessRoles.some((r) => held.has(r));
+}
+
 function isAdminByGroup(claims: SsoClaims, cfg: SsoConfig): boolean {
   return !!cfg.adminGroup && (claims.groups ?? []).includes(cfg.adminGroup);
 }
@@ -202,12 +268,18 @@ export async function upsertSsoUser(claims: SsoClaims, cfg: SsoConfig): Promise<
   const email = claims.email?.toLowerCase();
 
   let user = await prisma.user.findUnique({ where: { ssoSubject: claims.sub } });
+  const byEmail = !user && email ? await prisma.user.findUnique({ where: { email } }) : null;
 
-  if (!user && email) {
-    const byEmail = await prisma.user.findUnique({ where: { email } });
-    if (byEmail) {
-      user = await prisma.user.update({ where: { id: byEmail.id }, data: { ssoSubject: claims.sub } });
-    }
+  // The access gate runs BEFORE anything is linked or created, so a refused login leaves
+  // no trace on the account. It never applies to an admin (by group, or already one in
+  // the DB): an environment role that could lock out the owner would be unrecoverable.
+  const known = user ?? byEmail;
+  if (!hasAccessRole(claims, cfg) && !isAdminByGroup(claims, cfg) && known?.role !== 'admin') {
+    throw new Error(NO_ACCESS_MESSAGE);
+  }
+
+  if (!user && byEmail) {
+    user = await prisma.user.update({ where: { id: byEmail.id }, data: { ssoSubject: claims.sub } });
   }
 
   if (!user) {
@@ -223,6 +295,10 @@ export async function upsertSsoUser(claims: SsoClaims, cfg: SsoConfig): Promise<
         // SSO users authenticate via the IdP; give them an unusable random local password.
         passwordHash: await hashPassword(randomBytes(32).toString('hex')),
         ssoSubject: claims.sub,
+        // Quota the admin chose for newcomers (0 = none, the historical default).
+        maxCpu: cfg.newUserCpu,
+        maxRam: cfg.newUserRam,
+        maxStorage: cfg.newUserStorage,
       },
     });
     return user;

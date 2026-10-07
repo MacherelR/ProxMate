@@ -101,6 +101,8 @@ export default function SettingsPage() {
   const [isoStorage, setIsoStorage] = useState("");
   const [backupStorage, setBackupStorage] = useState(BACKUP_AUTO);
   const [savingDefaults, setSavingDefaults] = useState(false);
+  // Non-admin users pick a pool / network / storage the Proxmox account can use.
+  const [userPlacement, setUserPlacement] = useState(false);
 
   // SMTP (email) — optional
   const [smtpHost, setSmtpHost] = useState("");
@@ -132,6 +134,11 @@ export default function SettingsPage() {
   const [ssoAllowSignup, setSsoAllowSignup] = useState(false);
   const [ssoButtonLabel, setSsoButtonLabel] = useState("Sign in with SSO");
   const [ssoHasSecret, setSsoHasSecret] = useState(false);
+  // Who may sign in to THIS instance (roles/groups, comma-separated). Blank = anyone the IdP admits.
+  const [ssoAccessRoles, setSsoAccessRoles] = useState("");
+  const [ssoNewCpu, setSsoNewCpu] = useState("0");
+  const [ssoNewRamGb, setSsoNewRamGb] = useState("0");
+  const [ssoNewStorage, setSsoNewStorage] = useState("0");
   const [ssoCallbackUrl, setSsoCallbackUrl] = useState("");
   const [savingSso, setSavingSso] = useState(false);
   const [testingSso, setTestingSso] = useState(false);
@@ -233,6 +240,7 @@ export default function SettingsPage() {
         setBridge(defaults.bridge ?? "");
         setIsoStorage(defaults.isoStorage ?? "");
         setBackupStorage(defaults.backupStorage || BACKUP_AUTO);
+        setUserPlacement(defaults.userPlacement === true);
         if (res.data.smtp.configured) {
           const s = res.data.smtp;
           setSmtpHost(s.host);
@@ -260,6 +268,10 @@ export default function SettingsPage() {
           setSsoAdminGroup(s.adminGroup);
           setSsoAllowSignup(s.allowSignup);
           setSsoButtonLabel(s.buttonLabel);
+          setSsoAccessRoles(s.accessRoles);
+          setSsoNewCpu(String(s.newUserCpu));
+          setSsoNewRamGb(String(Math.round(s.newUserRam / 1024)));
+          setSsoNewStorage(String(s.newUserStorage));
           setSsoHasSecret(s.hasSecret);
         }
       })
@@ -327,6 +339,7 @@ export default function SettingsPage() {
         bridge,
         isoStorage,
         backupStorage: backupStorage === BACKUP_AUTO ? "" : backupStorage,
+        userPlacement,
       });
       toast.success("Defaults saved.");
     } catch (err) {
@@ -423,6 +436,7 @@ export default function SettingsPage() {
       toast.error("Enter the issuer URL and client ID.");
       return;
     }
+    const whole = (v: string) => Math.max(0, Math.floor(Number(v) || 0));
     setSavingSso(true);
     try {
       await api.put("/admin/settings/sso", {
@@ -435,6 +449,10 @@ export default function SettingsPage() {
         adminGroup: ssoAdminGroup || undefined,
         allowSignup: ssoAllowSignup,
         buttonLabel: ssoButtonLabel || undefined,
+        accessRoles: ssoAccessRoles.trim(),
+        newUserCpu: whole(ssoNewCpu),
+        newUserRam: whole(ssoNewRamGb) * 1024,
+        newUserStorage: whole(ssoNewStorage),
       });
       if (ssoClientSecret) setSsoHasSecret(true);
       setSsoClientSecret("");
@@ -636,6 +654,24 @@ export default function SettingsPage() {
                       </SelectContent>
                     </Select>
                   </FormField>
+                  <label className="flex items-start gap-2 rounded-md border bg-muted/40 p-3 text-sm select-none">
+                    <input
+                      type="checkbox"
+                      checked={userPlacement}
+                      onChange={(e) => setUserPlacement(e.target.checked)}
+                      className="mt-0.5 size-4 rounded border-input accent-primary"
+                    />
+                    <span>
+                      <span className="font-medium">Users choose pool, network and storage</span>
+                      <span className="block text-xs text-muted-foreground">
+                        For an instance that runs with a Proxmox account scoped to one environment (a
+                        pool, an SDN zone, a template pool). Non-admin users must pick a pool, network
+                        and storage for each machine, and are offered only what that account can use —
+                        the defaults above then apply to admins only. Rebuild and restore-from-upload
+                        are unavailable to those users.
+                      </span>
+                    </span>
+                  </label>
                   <Button type="submit" disabled={savingDefaults} className="w-fit">
                     {savingDefaults ? <Loader2 className="animate-spin" /> : <Save />}
                     Save defaults
@@ -1058,6 +1094,55 @@ export default function SettingsPage() {
                   />
                   Auto-create accounts for new SSO users. Off = only existing/invited accounts may sign in.
                 </label>
+                <FormField
+                  label="Access roles"
+                  htmlFor="ssoAccessRoles"
+                  hint="Who may use THIS ProxMate: a non-admin user must hold at least one of these values (comma-separated) in the groups/roles claim above, or sign-in is refused. Blank = anyone the identity provider admits. Admins are never locked out. Takes effect at the next sign-in."
+                >
+                  <Input
+                    id="ssoAccessRoles"
+                    value={ssoAccessRoles}
+                    onChange={(e) => setSsoAccessRoles(e.target.value)}
+                    placeholder="developer-delfino-02, developer-delfino"
+                  />
+                </FormField>
+                <div className="grid gap-3 rounded-md border bg-muted/40 p-3">
+                  <div className="text-sm font-medium">Quota for auto-created SSO users</div>
+                  <p className="text-xs text-muted-foreground">
+                    Applied only when an account is created at first sign-in; 0 = none (they cannot deploy
+                    until an admin raises it). The Proxmox account this instance runs with decides <em>where</em> they
+                    may deploy — this decides <em>how much</em>.
+                  </p>
+                  <div className="grid gap-4 sm:grid-cols-3">
+                    <FormField label="vCPU" htmlFor="ssoNewCpu">
+                      <Input
+                        id="ssoNewCpu"
+                        type="number"
+                        min={0}
+                        value={ssoNewCpu}
+                        onChange={(e) => setSsoNewCpu(e.target.value)}
+                      />
+                    </FormField>
+                    <FormField label="RAM (GB)" htmlFor="ssoNewRam">
+                      <Input
+                        id="ssoNewRam"
+                        type="number"
+                        min={0}
+                        value={ssoNewRamGb}
+                        onChange={(e) => setSsoNewRamGb(e.target.value)}
+                      />
+                    </FormField>
+                    <FormField label="Disk (GB)" htmlFor="ssoNewStorage">
+                      <Input
+                        id="ssoNewStorage"
+                        type="number"
+                        min={0}
+                        value={ssoNewStorage}
+                        onChange={(e) => setSsoNewStorage(e.target.value)}
+                      />
+                    </FormField>
+                  </div>
+                </div>
                 <label className="flex items-center gap-2 text-sm select-none">
                   <input
                     type="checkbox"

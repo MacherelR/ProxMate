@@ -296,6 +296,51 @@ Admin **Settings ▸ Access tab ▸ Single sign-on (OIDC)**:
 - **Admin mapping:** a Keycloak user in `proxmate-admins` becomes an admin (members
   are promoted; the mapping never auto-demotes an existing admin/owner).
 
+### 9.4 One ProxMate per environment (role-gated access + scoped Proxmox account)
+
+Use this when a ProxMate instance serves **one environment** (an exercise network, a lab, a
+team) and must not be able to touch anything else. Isolation comes from two independent layers:
+
+1. **WHERE — the Proxmox account.** Configure ProxMate (OOBE, or Settings ▸ Proxmox) with a
+   *dedicated* Proxmox user + API token whose ACLs cover only that environment: its resource
+   pool, its SDN zone, the shared template pool and the storages of the pool. Proxmox itself
+   refuses anything outside — there is nothing in ProxMate to bypass.
+2. **WHO — a role claim.** Set **Access roles** (Settings ▸ Access ▸ Single sign-on). A non-admin
+   user can only sign in when the ID token carries at least one of those values, e.g.
+   `developer-env-01, developer-env` (the *groups/roles claim* above says which claim to read —
+   Keycloak client roles arrive flat in `roles`). Users without one are refused at the SSO
+   callback before anything is linked or created; admins are never locked out. Revocation takes
+   effect at the next sign-in (sessions last up to 24 h).
+
+**What the Proxmox account needs** (privileges, on the paths it should reach):
+
+| Need | Privilege |
+|---|---|
+| See guests, storages, pools | `VM.Audit`, `Datastore.Audit`, `Pool.Audit` |
+| Create / clone into the pool | `VM.Allocate`, `VM.Clone` (on the template pool), `Datastore.AllocateSpace` |
+| Configure and run guests | `VM.Config.CPU/Memory/Disk/Network/Cloudinit/Options`, `VM.PowerMgmt`, `VM.Console`, `VM.Snapshot`, `VM.GuestAgent.*` |
+| Attach NICs to the environment's networks | `SDN.Use` (and `SDN.Audit` to list them) on the zone |
+| Node health, capacity | `Sys.Audit` on `/` |
+
+Use a token with **privilege separation off** (`pveum user token add <user> <id> --privsep 0`), or
+grant the token itself. Settings ▸ Proxmox ▸ **Test** reports what is missing.
+
+**Let users choose where machines go** — Settings ▸ Proxmox ▸ *Users choose pool, network and
+storage*. With it on, a non-admin user must pick a pool, an SDN network and a storage for each
+machine and is offered only what the account can use (pools it can allocate in, networks it can
+`SDN.Use`, storages it can allocate on, templates it can clone). The API re-checks every choice,
+so a hand-crafted request gets the same answer, and a failed check refuses the deploy rather than
+guessing. Answers are cached for 30 seconds. Admins keep the classic defaults.
+
+**Behaviour to know about** (with placement on)
+- Machines do **not** get ProxMate's own tenant firewall or VLAN tag: the SDN zone is the
+  boundary, and the firewall's private-range drops would cut them off from the environment they
+  were deployed to join.
+- Guests record their pool and network; **duplicates stay in the same pool and network**.
+  **Rebuild** and **restore from upload** are unavailable (both re-provision from server defaults).
+- Quotas still apply on top. A newly auto-created SSO user gets the *quota for auto-created SSO
+  users* configured in the same card (0 = none, so they cannot deploy until you raise it).
+
 ---
 
 ## 10. Two-step authentication — full test matrix
@@ -618,6 +663,9 @@ then read `/var/backups/proxmate`. See §12.
 | Passkey enroll/login fails silently | Not HTTPS, or `WEBAUTHN_RP_ID`/`WEBAUTHN_ORIGIN` don't match the domain in the browser bar. RP ID = domain only, ORIGIN = full `https://…`. |
 | Logged out immediately / cookies not sticking | `COOKIE_SECURE=true` requires HTTPS; make sure you're on the HTTPS origin and `FRONTEND_URL`/`NEXT_PUBLIC_API_URL` use the same domain. |
 | SSO: "redirect_uri mismatch" | The redirect URI in Keycloak must be **exactly** `${BACKEND_PUBLIC_URL}/api/auth/sso/callback`. |
+| SSO: "Your account has no access to this environment" | The token carries none of the **Access roles**. Check the claim name (Groups/roles claim) and that the role is emitted in the ID token, or clear Access roles to disable the gate. |
+| Deploy refused: "This environment's Proxmox account isn't allowed to … (<privilege> on <path>)" | The named privilege is missing on that path for ProxMate's Proxmox account (§9.4). Grant it in Proxmox (or pick a pool/network/storage it can use); answers are cached ≤30 s. |
+| Wizard shows empty Pool/Network/Storage lists | The Proxmox account holds `VM.Allocate` / `SDN.Use` / `Datastore.AllocateSpace` on nothing that exists yet — fix its ACLs; use Settings ▸ Proxmox ▸ Test. |
 | SSO: discovery/Test fails | Issuer must serve `/.well-known/openid-configuration`; check the client secret and that the realm name is right. |
 | Proxmox storage empty / VM create 403 | Token has **Privilege Separation ON** — recreate with `--privsep 0` (§2.2). |
 | Rate-limit/audit shows the proxy IP, not the client | Set `TRUST_PROXY=1` (already in the production `.env`). |

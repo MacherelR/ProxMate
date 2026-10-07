@@ -76,6 +76,7 @@ import {
   syncVmNode,
 } from '../services/vm.service.js';
 import { isValidPublicKey } from '../services/ssh-key.service.js';
+import { resolvePlacement, assertMayDuplicate, assertNotScoped, PlacementSchema } from '../services/pve-scope.service.js';
 import { isIdeInstalling } from '../services/ide-provision.service.js';
 import { isDeploying, refreshDeployState } from '../services/deploy-lock.service.js';
 import { getLiveStats } from '../services/live-stats.service.js';
@@ -187,6 +188,9 @@ const CreateVmSchema = z.object({
   forUserId: z.string().min(1).max(64).optional(),
   // …optionally as a grant that doesn't count toward their quota.
   quotaExempt: z.boolean().optional(),
+  // Confined users only (placement enforced): where the guest goes. Vetted against what
+  // the instance's Proxmox account may do, before anything is created (see resolvePlacement).
+  placement: PlacementSchema.optional(),
 });
 
 router.post('/', async (req: Request, res: Response) => {
@@ -201,15 +205,21 @@ router.post('/', async (req: Request, res: Response) => {
     // The guest's OWNER (the acting user, or the admin's chosen tenant) — quota
     // applies to them; node/forUserId/quotaExempt are admin-only options.
     const owner = await resolveCreateTarget(actor, parsed.data);
-    const vm = await createVm(owner, { ...parsed.data, adminManaged: owner.id !== actor.id });
+    // The ACTOR's Proxmox rights bound the placement, whoever ends up owning the guest.
+    const placement = await resolvePlacement(actor, parsed.data.placement ?? {}, {
+      kind: 'iso',
+      isoStorage: (await getConfig('iso_storage')) ?? '',
+    });
+    const vm = await createVm(owner, { ...parsed.data, placement, adminManaged: owner.id !== actor.id });
     const forNote = owner.id !== actor.id ? ` for ${owner.email}` : '';
     const exemptNote = vm.quotaExempt ? ', quota-exempt' : '';
+    const placeNote = placement ? `, pool ${placement.pool}, net ${placement.bridge}` : '';
     await recordAudit({
       action: 'vm.create',
       actor,
       targetType: 'vm',
       targetId: vm.id,
-      detail: `${vm.name}${forNote} (vmid ${vm.proxmoxVmId} on ${vm.proxmoxNode}, ${vm.cpu}c/${vm.ram}MB/${vm.storage}GB${exemptNote})`,
+      detail: `${vm.name}${forNote} (vmid ${vm.proxmoxVmId} on ${vm.proxmoxNode}, ${vm.cpu}c/${vm.ram}MB/${vm.storage}GB${exemptNote}${placeNote})`,
       req,
     });
     res.status(201).json({ vm, status: vm.status });
@@ -286,6 +296,14 @@ router.post('/restore-upload', async (req: Request, res: Response) => {
   const { id } = (req as AuthRequest).user;
   const user = await prisma.user.findUnique({ where: { id } });
   if (!user) { res.status(404).json({ error: 'User not found' }); return; }
+  // Restores land on server-default storage/bridge with no pool — closed to scoped
+  // accounts, and refused BEFORE the (large) upload is accepted.
+  try {
+    await assertNotScoped(user, 'Restoring an uploaded backup');
+  } catch (err) {
+    if (err instanceof CreateOptionError) { res.status(err.status).json({ error: err.message }); return; }
+    throw err;
+  }
 
   // Run multer explicitly so its errors map to proper HTTP responses.
   const uploadErr = await new Promise<unknown>((resolve) =>
@@ -387,6 +405,8 @@ const CreateContainerSchema = z.object({
   // Admin-only options — see CreateVmSchema.
   forUserId: z.string().min(1).max(64).optional(),
   quotaExempt: z.boolean().optional(),
+  // Confined users only — see CreateVmSchema.
+  placement: PlacementSchema.optional(),
 });
 
 router.post('/containers', async (req: Request, res: Response) => {
@@ -403,15 +423,20 @@ router.post('/containers', async (req: Request, res: Response) => {
   const actor = (req as AuthRequest).user;
   try {
     const owner = await resolveCreateTarget(actor, parsed.data);
-    const vm = await createContainer(owner, { ...parsed.data, adminManaged: owner.id !== actor.id });
+    const placement = await resolvePlacement(actor, parsed.data.placement ?? {}, {
+      kind: 'lxc',
+      templateVolid: parsed.data.template,
+    });
+    const vm = await createContainer(owner, { ...parsed.data, placement, adminManaged: owner.id !== actor.id });
     const forNote = owner.id !== actor.id ? ` for ${owner.email}` : '';
     const exemptNote = vm.quotaExempt ? ', quota-exempt' : '';
+    const placeNote = placement ? `, pool ${placement.pool}, net ${placement.bridge}` : '';
     await recordAudit({
       action: 'vm.create',
       actor,
       targetType: 'vm',
       targetId: vm.id,
-      detail: `${vm.name}${forNote} (LXC, vmid ${vm.proxmoxVmId} on ${vm.proxmoxNode}, ${vm.cpu}c/${vm.ram}MB/${vm.storage}GB${exemptNote})`,
+      detail: `${vm.name}${forNote} (LXC, vmid ${vm.proxmoxVmId} on ${vm.proxmoxNode}, ${vm.cpu}c/${vm.ram}MB/${vm.storage}GB${exemptNote}${placeNote})`,
       req,
     });
     res.status(201).json({ vm, status: vm.status });
@@ -1104,6 +1129,9 @@ router.post('/:id/duplicate', async (req: Request, res: Response) => {
   }
 
   try {
+    // A scoped account may only copy INTO the pool / network its source was placed in,
+    // and only while Proxmox still grants both (unscoped accounts pass straight through).
+    await assertMayDuplicate(user, vm);
     const copy = await duplicateVm(vm, parsed.data.name);
     await recordAudit({
       action: 'vm.duplicate', actor: user, targetType: 'vm', targetId: vm.id,
@@ -1111,6 +1139,7 @@ router.post('/:id/duplicate', async (req: Request, res: Response) => {
     });
     res.status(201).json(copy);
   } catch (err) {
+    if (err instanceof CreateOptionError) { res.status(err.status).json({ error: err.message }); return; }
     if (err instanceof QuotaError) { res.status(403).json({ error: 'Quota exceeded', details: err.details }); return; }
     const msg = pveMessage(err);
     res.status(/Stop the machine|can't be duplicated/.test(msg) ? 409 : 502).json({ error: msg });
@@ -1366,6 +1395,9 @@ router.post('/:id/rebuild', async (req: Request, res: Response) => {
   if (!user) { res.status(404).json({ error: 'User not found' }); return; }
 
   try {
+    // A rebuild re-provisions from server defaults, so it is closed to scoped accounts
+    // (and rebuildVm itself refuses any guest that lives in a Proxmox pool).
+    await assertNotScoped(authUser, 'Rebuilding a machine');
     let source: RebuildSource;
     let sourceLabel: string;
     if (parsed.data.templateId) {
@@ -1389,6 +1421,10 @@ router.post('/:id/rebuild', async (req: Request, res: Response) => {
     });
     res.json(rebuilt);
   } catch (err) {
+    if (err instanceof CreateOptionError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     if (err instanceof QuotaError) {
       res.status(403).json({ error: 'Quota exceeded', details: err.details });
       return;

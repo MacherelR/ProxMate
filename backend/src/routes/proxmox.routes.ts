@@ -3,6 +3,8 @@ import { requireAuth } from '../middleware/auth.js';
 import { enforceMfaSetup } from '../middleware/mfa.js';
 import { getNodes, getIsos, getStorages, pveMessage } from '../services/proxmox.service.js';
 import { getProxmoxResources } from '../services/setup.service.js';
+import { getScopeOptions, ScopeError } from '../services/pve-scope.service.js';
+import type { AuthRequest } from '../types/index.js';
 
 const router = Router();
 
@@ -18,6 +20,25 @@ router.get('/resources', async (_req: Request, res: Response) => {
     const resources = await getProxmoxResources();
     res.json(resources);
   } catch (err) {
+    res.status(502).json({ error: pveMessage(err) });
+  }
+});
+
+// ─── GET /api/proxmox/scope ───────────────────────────────────
+// What THIS user may pick in the deploy wizard — the pools, storages, networks and
+// templates Proxmox grants their identity. `{ scoped: false }` for everyone the
+// feature doesn't apply to (admins, local accounts, scoping off): they keep the
+// classic wizard. Advisory only — the deploy routes re-check every choice.
+
+router.get('/scope', async (req: Request, res: Response) => {
+  try {
+    const options = await getScopeOptions((req as AuthRequest).user);
+    res.json(options ?? { scoped: false });
+  } catch (err) {
+    if (err instanceof ScopeError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     res.status(502).json({ error: pveMessage(err) });
   }
 });

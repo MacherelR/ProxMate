@@ -15,6 +15,16 @@
 - `deploy.agent_missing` notification when a deploy's guest agent never responds. Previously the only signals were a log line and a tenant unable to log in.
 - `GET /api/admin/storage-pinning` lists guests that cannot migrate, using Proxmox's own migration preflight.
 
+## One instance per environment
+
+ProxMate can now be pinned to a single environment. Isolation comes from two layers: the Proxmox account the instance runs with (its ACLs are the boundary — Proxmox refuses anything outside them), and a role claim that decides who may sign in. See `DEPLOYMENT.md` §9.4.
+
+- **Access roles** (Settings ▸ Access): a non-admin SSO user needs at least one of the listed roles in the groups/roles claim, or sign-in is refused before any account is linked or created. Admins are never locked out. Blank keeps the old behaviour.
+- **Users choose pool, network and storage** (Settings ▸ Proxmox, off by default): non-admin users pick where each machine goes and are offered only what the Proxmox account can use. Every choice is checked again on the API against the account's effective privileges (`GET /access/permissions?path=…`) and refused, not guessed, when a check fails. A source-scan test fails if a guest-creating route stops calling the check.
+- New guests record their pool and network; duplicates stay in the same pool and network. Rebuild and restore-from-upload are refused while placement is on, because both re-provision from server defaults.
+- Placed machines skip ProxMate's own tenant firewall and VLAN tag; the granted SDN zone is the boundary.
+- Auto-created SSO users can be given a default quota (previously always zero).
+
 ## Modules
 
 Self-hosted installs can add API routes and database tables without patching `app.ts`. A module is a directory exporting an Express router, enabled by name in `PROXMATE_MODULES` and served under `/api/ext/<name>`.
@@ -25,7 +35,7 @@ With no module configured no import is attempted and no route is added. See `bac
 
 ## Upgrading
 
-No configuration changes required.
+No configuration changes required. Run the database migration (`20260921120000_pve_scope`, adds three nullable columns).
 
 - Rebuild cloud-image templates to pick up the guest agent. Password-only deploys from templates built before this release produce machines their owner cannot log into. Template Store flags them.
 - Guests created before this release keep their existing storage. `GET /api/admin/storage-pinning` lists any that cannot migrate as a result.

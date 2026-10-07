@@ -91,5 +91,6 @@ export const openApiSpec = {
     '/templates': { get: { summary: 'List published templates', security: bearer, responses: { 200: { description: 'OK' } } } },
     '/templates/deploy': { post: { summary: 'Deploy a VM from a template', security: bearer, responses: { 201: { description: 'Created' } } } },
     '/proxmox/isos': { get: { summary: 'List installable ISOs', security: bearer, responses: { 200: { description: 'OK' } } } },
+    '/proxmox/scope': { get: { summary: 'What this instance lets a user pick when deploying: pools, networks, storages, templates ({ scoped: false } when placement is not enforced for them)', security: bearer, responses: { 200: { description: 'OK' } } } },
   },
 } as const;

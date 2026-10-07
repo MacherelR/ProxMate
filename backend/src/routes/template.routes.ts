@@ -7,6 +7,7 @@ import { enforceMfaSetup } from '../middleware/mfa.js';
 import { pveMessage } from '../services/proxmox.service.js';
 import { assertPublicHttpUrlShape } from '../lib/url-safety.js';
 import { deployFromTemplate, QuotaError, CreateOptionError, resolveCreateTarget } from '../services/vm.service.js';
+import { resolvePlacement, PlacementSchema } from '../services/pve-scope.service.js';
 import {
   listPublished,
   listAll,
@@ -75,6 +76,9 @@ const DeploySchema = z.object({
   // template deploys cannot choose a node — the clone stays on the template's.
   forUserId: z.string().min(1).max(64).optional(),
   quotaExempt: z.boolean().optional(),
+  // Confined users only (placement enforced): where the clone goes (vetted against the Proxmox account's own
+  // ACLs for the ACTING user in resolvePlacement — see pve-scope.service.ts).
+  placement: PlacementSchema.optional(),
 });
 
 router.post('/deploy', async (req: Request, res: Response) => {
@@ -101,7 +105,11 @@ router.post('/deploy', async (req: Request, res: Response) => {
     // The guest's OWNER (the acting user, or the admin's chosen tenant) — quota
     // applies to them; forUserId/quotaExempt are admin-only options.
     const owner = await resolveCreateTarget(actor, parsed.data);
-    const vm = await deployFromTemplate(owner, template, { ...parsed.data, adminManaged: owner.id !== actor.id });
+    const placement = await resolvePlacement(actor, parsed.data.placement ?? {}, {
+      kind: 'template',
+      vmid: template.proxmoxVmId,
+    });
+    const vm = await deployFromTemplate(owner, template, { ...parsed.data, placement, adminManaged: owner.id !== actor.id });
     res.status(201).json({ vm, status: vm.status });
   } catch (err) {
     if (err instanceof CreateOptionError) {

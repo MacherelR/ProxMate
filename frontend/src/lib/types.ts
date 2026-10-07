@@ -41,7 +41,37 @@ export interface MeResponse {
      * wrong client clock must never lock someone out nor keep them in.
      */
     accessExpired?: boolean;
+    /**
+     * True when this account must choose a pool / network / storage that the instance's
+     * Proxmox account can use (admin turned placement on). Drives the placement pickers in
+     * the create wizard; the API enforces the same rule regardless.
+     */
+    pveScoped?: boolean;
   };
+}
+
+/**
+ * What a confined user may pick when deploying: exactly the pools, storages, networks
+ * (SDN VNets) and templates this instance's Proxmox account can use. `{ scoped: false }`
+ * for everyone the feature doesn't apply to (they keep the classic wizard).
+ */
+export interface PveScopeOptions {
+  scoped: true;
+  pools: { id: string; comment?: string }[];
+  storages: { name: string; type: string; content?: string }[];
+  networks: { id: string; zone: string }[];
+  /** ProxMate template ids the user may clone. */
+  templateIds: string[];
+  isoAllowed: boolean;
+  lxcAllowed: boolean;
+}
+export type PveScopeResponse = { scoped: false } | PveScopeOptions;
+
+/** Where a scoped deploy goes — sent as `placement`, vetted server-side. */
+export interface Placement {
+  pool: string;
+  bridge: string;
+  storage: string;
 }
 
 export interface AuthResponse {
@@ -431,7 +461,14 @@ export interface UpdateStatus {
 
 export interface AdminSettings {
   proxmox: { host: string | null; tokenId: string | null; verifySsl: boolean; hasSecret: boolean };
-  defaults: { storage: string | null; bridge: string | null; isoStorage: string | null; backupStorage: string | null };
+  defaults: {
+    storage: string | null;
+    bridge: string | null;
+    isoStorage: string | null;
+    backupStorage: string | null;
+    /** Non-admin users choose a pool / network / storage the Proxmox account can use. */
+    userPlacement: boolean;
+  };
   smtp:
     | { configured: false }
     | { configured: true; host: string; port: number; secure: boolean; user: string; from: string; hasPass: boolean };
@@ -447,6 +484,12 @@ export interface AdminSettings {
         adminGroup: string;
         allowSignup: boolean;
         buttonLabel: string;
+        /** Role/group values (comma-separated) a non-admin needs one of to sign in. Blank = no gate. */
+        accessRoles: string;
+        /** Quota given to newly auto-created SSO users (0 = none). RAM in MB, disk in GB. */
+        newUserCpu: number;
+        newUserRam: number;
+        newUserStorage: number;
         hasSecret: boolean;
         callbackUrl: string;
       };

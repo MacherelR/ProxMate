@@ -42,6 +42,14 @@ curl -H "$AUTH" -H 'content-type: application/json' \
   -d '{"name":"web-01","cpu":2,"ram":2048,"storage":20,"os":"debian-12.iso"}' \
   "$BASE/vms"
 
+# When the admin enabled "users choose pool, network and storage" (DEPLOYMENT.md §9.4): see what
+# this instance allows, then add a `placement` to any create/deploy call. Re-checked server-side.
+curl -H "$AUTH" "$BASE/proxmox/scope"   # → { scoped, pools, networks, storages, templateIds, … }
+curl -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"name":"web-01","cpu":2,"ram":2048,"storage":20,"os":"debian-12.iso",
+       "placement":{"pool":"env/env-01","bridge":"vnet01","storage":"ceph-vm"}}' \
+  "$BASE/vms"
+
 # Start / stop / restart
 curl -H "$AUTH" -X POST "$BASE/vms/<id>/start"
 curl -H "$AUTH" -X POST "$BASE/vms/<id>/stop?force=true"

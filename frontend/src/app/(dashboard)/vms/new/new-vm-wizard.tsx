@@ -4,10 +4,10 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
-import { ArrowLeft, Loader2, Plus, Rocket, HardDrive, KeyRound, Server, Container, ArchiveRestore } from "lucide-react";
+import { ArrowLeft, Loader2, Plus, Rocket, HardDrive, KeyRound, Server, Container, ArchiveRestore, MapPin } from "lucide-react";
 import { api, apiError } from "@/lib/api";
 import { useAuthStore } from "@/lib/auth-store";
-import type { MeResponse, ProxmoxIso, LxcTemplate, Template, VirtualMachine, SshKey } from "@/lib/types";
+import type { MeResponse, ProxmoxIso, LxcTemplate, Template, VirtualMachine, SshKey, PveScopeResponse } from "@/lib/types";
 import { formatRam } from "@/lib/format";
 import { PageHeader } from "@/components/dashboard/page-header";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -102,6 +102,14 @@ export default function NewVmWizard() {
   const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
+  // Placement: this account must choose where a machine goes, from what the instance's
+  // Proxmox account can use. `pveScoped` comes from /auth/me; `scope` is what it offers.
+  const [pveScoped, setPveScoped] = useState(false);
+  const [scope, setScope] = useState<PveScopeResponse | null>(null);
+  const [scopeError, setScopeError] = useState<string | null>(null);
+  const [placePool, setPlacePool] = useState("");
+  const [placeBridge, setPlaceBridge] = useState("");
+  const [placeStorage, setPlaceStorage] = useState("");
   // Admin-only deploy options: deploy INTO a tenant's account (optionally without
   // counting toward their quota) and/or pin the target node. "self"/"auto" =
   // the normal behavior every tenant gets.
@@ -147,8 +155,20 @@ export default function NewVmWizard() {
       api.get<LxcTemplate[]>("/vms/lxc-templates").catch(() => ({ data: [] as LxcTemplate[] })),
       // Whether restore-from-upload is available (backup share mounted rw). Never block.
       api.get<{ enabled: boolean }>("/vms/restore-capability").catch(() => ({ data: { enabled: false } })),
+      // What Proxmox lets THIS user pick (pools, networks, storages, templates).
+      // `{ scoped: false }` for everyone the feature doesn't apply to. A failure is
+      // kept, not swallowed: a scoped user can't deploy without it, and needs to know why.
+      api
+        .get<PveScopeResponse>("/proxmox/scope")
+        .then((r) => ({ data: r.data, error: null as string | null }))
+        .catch((err) => ({ data: { scoped: false } as PveScopeResponse, error: apiError(err) })),
     ])
-      .then(([meRes, isosRes, tplRes, extrasRes, keysRes, lxcRes, restoreRes]) => {
+      .then(([meRes, isosRes, tplRes, extrasRes, keysRes, lxcRes, restoreRes, scopeRes]) => {
+        const scoped = meRes.data.user.pveScoped === true;
+        const granted = scopeRes.data.scoped ? scopeRes.data : null;
+        setPveScoped(scoped);
+        setScope(scopeRes.data);
+        setScopeError(scoped ? scopeRes.error : null);
         setQuota(meRes.data.user.quota);
         setIsos(isosRes.data);
         setTemplates(tplRes.data);
@@ -160,10 +180,24 @@ export default function NewVmWizard() {
         setLxcTemplates(lxcRes.data ?? []);
         setRestoreEnabled(restoreRes.data.enabled === true);
 
+        // A scoped account starts on something it may actually use (never on an ISO
+        // install it has no rights for).
+        if (scoped && granted && !granted.isoAllowed) {
+          const firstTemplate = tplRes.data.find((t) => granted.templateIds.includes(t.id));
+          if (firstTemplate) {
+            setSource(firstTemplate.id);
+            setStorageGb(Math.max(firstTemplate.diskGb, 1));
+            if (firstTemplate.cloudInit) setUsername(cloudUserForOs(firstTemplate.os));
+          } else if (granted.lxcAllowed) {
+            setSource(CONTAINER);
+            setStorageGb(CONTAINER_DISK_DEFAULT);
+          }
+        }
+
         // Deep-link preselect: /vms/new?template=<id> (e.g. the store's Deploy button).
         const wanted = searchParams.get("template");
         const preselected = wanted ? tplRes.data.find((t) => t.id === wanted) : undefined;
-        if (preselected) {
+        if (preselected && (!scoped || (granted && granted.templateIds.includes(preselected.id)))) {
           setSource(preselected.id);
           setStorageGb(Math.max(preselected.diskGb, 1));
           if (preselected.cloudInit) setUsername(cloudUserForOs(preselected.os));
@@ -175,6 +209,16 @@ export default function NewVmWizard() {
 
   const isContainer = source === CONTAINER;
   const isRestore = source === RESTORE;
+  const scopeOpts = pveScoped && scope?.scoped ? scope : null;
+  // A scoped account sees only the templates Proxmox lets it clone.
+  const visibleTemplates = scopeOpts ? templates.filter((t) => scopeOpts.templateIds.includes(t.id)) : templates;
+  const showIso = !scopeOpts || scopeOpts.isoAllowed;
+  const showContainer = !scopeOpts || scopeOpts.lxcAllowed;
+  // A container's rootfs needs `rootdir` storage; a VM disk needs `images`.
+  const storageOptions = scopeOpts
+    ? scopeOpts.storages.filter((st) => (st.content ?? "").split(",").includes(isContainer ? "rootdir" : "images"))
+    : [];
+  const nothingToDeploy = !!scopeOpts && !showIso && !showContainer && visibleTemplates.length === 0;
   const template =
     source === CUSTOM || isContainer || isRestore ? null : templates.find((t) => t.id === source) ?? null;
   const isCustom = source === CUSTOM;
@@ -192,6 +236,15 @@ export default function NewVmWizard() {
   const bundleReady =
     cloudOnDemand || selectedFeatures.length === 0 || nodeSnippets.includes(cloudSnippetFile(selectedFeatures));
   const minDisk = template?.diskGb ?? 1;
+
+  // The effective placement: the user's pick while it is still one Proxmox grants,
+  // otherwise the first option that is. Derived (not synced) so a change of source
+  // (VM <-> container changes which storages qualify) can never leave a stale choice.
+  const pool = scopeOpts?.pools.some((p) => p.id === placePool) ? placePool : (scopeOpts?.pools[0]?.id ?? "");
+  const bridge = scopeOpts?.networks.some((n) => n.id === placeBridge) ? placeBridge : (scopeOpts?.networks[0]?.id ?? "");
+  const placementStorage = storageOptions.some((st) => st.name === placeStorage)
+    ? placeStorage
+    : (storageOptions[0]?.name ?? "");
 
   // Which preset (if any) the current cpu/ram/disk match, so its chip highlights.
   const activePreset = SIZE_PRESETS.find(
@@ -247,6 +300,11 @@ export default function NewVmWizard() {
       setErrors(e);
       return Object.keys(e).length === 0;
     }
+    if (pveScoped) {
+      if (!pool) e.pool = "Choose a pool";
+      if (!bridge) e.bridge = "Choose a network";
+      if (!placementStorage) e.placeStorage = "Choose a storage";
+    }
     if (cpu < 1) e.cpu = "At least 1 vCPU";
     else if (!isAdmin && cpu > cpuLeft) e.cpu = `Exceeds your remaining ${cpuLeft} vCPU`;
     if (!isAdmin && ramGb * 1024 > ramLeftMb) e.ram = `Exceeds your remaining ${formatRam(ramLeftMb)}`;
@@ -271,6 +329,11 @@ export default function NewVmWizard() {
     }
     setErrors(e);
     return Object.keys(e).length === 0;
+  }
+
+  /** Where a scoped account's machine goes — re-vetted against Proxmox by the API. */
+  function placementOpts(): { placement?: { pool: string; bridge: string; storage: string } } {
+    return pveScoped ? { placement: { pool, bridge, storage: placementStorage } } : {};
   }
 
   /** The admin-only create options actually selected (empty for tenants/defaults). */
@@ -312,6 +375,7 @@ export default function NewVmWizard() {
           // Tenants never send a node — the backend auto-schedules. Admins may
           // pin one (or deploy for a tenant) via the admin options below.
           ...adminOpts(true),
+          ...placementOpts(),
         });
         toast.success(`VM "${name}" is being created.`);
         router.push(`/vms/${res.data.vm.id}`);
@@ -325,6 +389,7 @@ export default function NewVmWizard() {
           sshKey: sshKey.trim() || undefined,
           password: password || undefined,
           ...adminOpts(true),
+          ...placementOpts(),
         });
         toast.success(`Container "${name}" is being created.`);
         router.push(`/vms/${res.data.vm.id}`);
@@ -345,6 +410,7 @@ export default function NewVmWizard() {
             : {}),
           // Template clones stay on the template's node — no node option here.
           ...adminOpts(false),
+          ...placementOpts(),
         });
         toast.success(`Deploying "${name}" from ${template?.name}.`);
         router.push(`/vms/${res.data.vm.id}`);
@@ -406,21 +472,25 @@ export default function NewVmWizard() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value={CUSTOM}>
-                        <span className="flex items-center gap-2">
-                          <Plus className="size-3.5" /> Custom VM (install from ISO)
-                        </span>
-                      </SelectItem>
-                      <SelectItem value={CONTAINER}>
-                        <span className="flex items-center gap-2">
-                          <Container className="size-3.5" /> Container (LXC)
-                        </span>
-                      </SelectItem>
-                      {templates.length > 0 && (
+                      {showIso && (
+                        <SelectItem value={CUSTOM}>
+                          <span className="flex items-center gap-2">
+                            <Plus className="size-3.5" /> Custom VM (install from ISO)
+                          </span>
+                        </SelectItem>
+                      )}
+                      {showContainer && (
+                        <SelectItem value={CONTAINER}>
+                          <span className="flex items-center gap-2">
+                            <Container className="size-3.5" /> Container (LXC)
+                          </span>
+                        </SelectItem>
+                      )}
+                      {visibleTemplates.length > 0 && (
                         <SelectGroup>
-                          <SelectSeparator />
+                          {(showIso || showContainer) && <SelectSeparator />}
                           <SelectLabel>Template Store</SelectLabel>
-                          {templates.map((t) => (
+                          {visibleTemplates.map((t) => (
                             <SelectItem key={t.id} value={t.id}>
                               <span className="flex items-center gap-2">
                                 <TemplateIcon os={t.os} name={t.name} icon={t.icon} className="size-3.5" /> {t.name}
@@ -430,7 +500,7 @@ export default function NewVmWizard() {
                           ))}
                         </SelectGroup>
                       )}
-                      {restoreEnabled && (
+                      {restoreEnabled && !pveScoped && (
                         <SelectGroup>
                           <SelectSeparator />
                           <SelectItem value={RESTORE}>
@@ -444,6 +514,70 @@ export default function NewVmWizard() {
                     </SelectContent>
                   </Select>
                 </FormField>
+
+                {nothingToDeploy && (
+                  <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
+                    This environment&apos;s Proxmox account has no pool, network and storage (or template) to
+                    deploy from yet. Ask an administrator to check its permissions.
+                  </div>
+                )}
+
+                {/* Proxmox-scoped accounts choose WHERE the machine runs, from exactly what
+                    Proxmox grants them. The API re-checks every choice on submit. */}
+                {pveScoped && !isRestore && (
+                  <div className="grid gap-3 rounded-md border bg-muted/40 p-3">
+                    <div className="flex items-center gap-1.5 text-sm font-medium">
+                      <MapPin className="size-3.5" /> Placement
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Only what this environment allows is listed.
+                    </p>
+                    {scopeError && <p className="text-xs text-destructive">{scopeError}</p>}
+                    <FormField label="Pool" error={errors.pool} hint="The Proxmox resource pool the machine belongs to.">
+                      <Select value={pool} onValueChange={(v) => setPlacePool(v as string)}>
+                        <SelectTrigger className="w-full">
+                          <SelectValue placeholder={scopeOpts?.pools.length ? "Select a pool" : "No pool available"} />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {(scopeOpts?.pools ?? []).map((p) => (
+                            <SelectItem key={p.id} value={p.id}>
+                              {p.id}
+                              {p.comment ? <span className="text-muted-foreground"> · {p.comment}</span> : null}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </FormField>
+                    <FormField label="Network" error={errors.bridge} hint="The SDN network (VNet) the machine is attached to.">
+                      <Select value={bridge} onValueChange={(v) => setPlaceBridge(v as string)}>
+                        <SelectTrigger className="w-full">
+                          <SelectValue placeholder={scopeOpts?.networks.length ? "Select a network" : "No network available"} />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {(scopeOpts?.networks ?? []).map((n) => (
+                            <SelectItem key={n.id} value={n.id}>
+                              {n.id} <span className="text-muted-foreground">· zone {n.zone}</span>
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </FormField>
+                    <FormField label="Storage" error={errors.placeStorage} hint="Where the machine's disk lives.">
+                      <Select value={placementStorage} onValueChange={(v) => setPlaceStorage(v as string)}>
+                        <SelectTrigger className="w-full">
+                          <SelectValue placeholder={storageOptions.length ? "Select a storage" : "No storage available"} />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {storageOptions.map((st) => (
+                            <SelectItem key={st.name} value={st.name}>
+                              {st.name} <span className="text-muted-foreground">· {st.type}</span>
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </FormField>
+                  </div>
+                )}
 
                 {template?.notes && (
                   <div className="rounded-md bg-muted/60 p-3 text-xs">

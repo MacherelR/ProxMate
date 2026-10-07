@@ -36,6 +36,7 @@ import { verifyKioskPin } from '../services/kiosk.service.js';
 import { recordAudit } from '../services/audit.service.js';
 import { isAccountLocked, registerFailedLogin, clearFailedLogins } from '../services/account-lockout.service.js';
 import { requestReset, resetWithToken } from '../services/password-reset.service.js';
+import { isScoped } from '../services/pve-scope.service.js';
 import type { AuthRequest } from '../types/index.js';
 
 const router = Router();
@@ -388,6 +389,10 @@ router.get('/me', allowExpiredAccess, requireAuth, async (req: Request, res: Res
       hasPasskeys: (await prisma.passkey.count({ where: { userId: user.id } })) > 0,
       mfaSetupRequired: await isMfaSetupRequired(user.id),
       broadcastOptOut: user.broadcastOptOut,
+      // Whether this user must choose a pool / network / storage the instance's Proxmox
+      // account can honour. Drives the wizard's placement pickers; the deploy routes
+      // enforce it regardless.
+      pveScoped: await isScoped(user),
       // Compute-access window. `accessExpiresAt: null` = never expires.
       // `accessExpired` is computed SERVER-side and is the only thing the UI may
       // trust to decide "expired" — a wrong client clock must not lock someone

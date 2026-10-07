@@ -58,6 +58,7 @@ import { announcementEmail } from '../lib/email-templates.js';
 import { unsubscribeToken } from '../services/broadcast-optout.service.js';
 import { getNotifyConfig, saveNotifyConfig, sendTestNotification, NOTIFY_EVENTS } from '../services/notify.service.js';
 import * as sso from '../services/sso.service.js';
+import { resetScopeCache } from '../services/pve-scope.service.js';
 import { getIdeConfig, saveIdeConfig, isValidIngressCidr } from '../services/ide.service.js';
 import { probeIdeReachability } from '../services/ide-provision.service.js';
 import {
@@ -93,7 +94,7 @@ router.get('/audit', async (req: Request, res: Response) => {
 // Returns current config (never the Proxmox token secret).
 
 router.get('/settings', async (_req: Request, res: Response) => {
-  const [host, tokenId, verifySsl, storage, bridge, isoStorage, backupStorage, rescueIso, templateRefresh] = await Promise.all([
+  const [host, tokenId, verifySsl, storage, bridge, isoStorage, backupStorage, rescueIso, templateRefresh, userPlacement] = await Promise.all([
     getConfig('proxmox_host'),
     getConfig('proxmox_token_id'),
     getConfig('proxmox_verify_ssl'),
@@ -103,13 +104,14 @@ router.get('/settings', async (_req: Request, res: Response) => {
     getConfig('backup_storage'),
     getConfig('rescue_iso'),
     getConfig('template_refresh_enabled'),
+    getConfig('pve_user_placement'),
   ]);
 
   const mail = await getMailConfig();
   const ssoCfg = await sso.getSsoConfig();
   res.json({
     proxmox: { host, tokenId, verifySsl: verifySsl === 'true', hasSecret: !!(await getConfig('proxmox_token_secret')) },
-    defaults: { storage, bridge, isoStorage, backupStorage },
+    defaults: { storage, bridge, isoStorage, backupStorage, userPlacement: userPlacement === 'true' },
     rescueIso,
     templateRefreshEnabled: templateRefresh === 'true',
     smtp: mail
@@ -127,6 +129,10 @@ router.get('/settings', async (_req: Request, res: Response) => {
           adminGroup: ssoCfg.adminGroup,
           allowSignup: ssoCfg.allowSignup,
           buttonLabel: ssoCfg.buttonLabel,
+          accessRoles: ssoCfg.accessRoles.join(', '),
+          newUserCpu: ssoCfg.newUserCpu,
+          newUserRam: ssoCfg.newUserRam,
+          newUserStorage: ssoCfg.newUserStorage,
           hasSecret: await sso.hasClientSecret(),
           callbackUrl: sso.callbackUrl(),
         }
@@ -408,6 +414,13 @@ const SsoSchema = z.object({
   adminGroup: z.string().optional(),
   allowSignup: z.boolean().optional(),
   buttonLabel: z.string().optional(),
+  // Roles/groups (comma-separated) of which a non-admin user must hold at least one to
+  // sign in to THIS instance. Blank = no gate.
+  accessRoles: z.string().max(1000).optional(),
+  // Quota handed to newly provisioned SSO users (0 = none).
+  newUserCpu: z.number().int().min(0).max(1024).optional(),
+  newUserRam: z.number().int().min(0).max(4_194_304).optional(),
+  newUserStorage: z.number().int().min(0).max(1_048_576).optional(),
 });
 
 router.put('/settings/sso', async (req: Request, res: Response) => {
@@ -479,6 +492,8 @@ router.put('/settings/proxmox', async (req: Request, res: Response) => {
   if (tokenSecret && tokenSecret.trim().length > 0) {
     await setConfig('proxmox_token_secret', tokenSecret, true);
   }
+  // A different account means different privileges: drop the cached placement answers.
+  resetScopeCache();
 
   res.json({ success: true });
 });
@@ -503,6 +518,9 @@ const DefaultsSchema = z.object({
   isoStorage: z.string().min(1),
   // Empty string = clear the override and let the backend auto-pick.
   backupStorage: z.string().optional(),
+  // Non-admin users choose a pool / network / storage from what the Proxmox account may
+  // use, instead of the defaults above (see pve-scope.service.ts). Omitted = unchanged.
+  userPlacement: z.boolean().optional(),
 });
 
 router.put('/settings/defaults', async (req: Request, res: Response) => {
@@ -521,7 +539,12 @@ router.put('/settings/defaults', async (req: Request, res: Response) => {
     isoStorage: await getConfig('iso_storage'),
     backupStorage: await getConfig('backup_storage'),
   };
+  const placementBefore = (await getConfig('pve_user_placement')) === 'true';
   await saveDefaults(parsed.data);
+  if (parsed.data.userPlacement !== undefined) {
+    await setConfig('pve_user_placement', String(parsed.data.userPlacement));
+    resetScopeCache();
+  }
 
   const changes: string[] = [];
   const note = (label: string, from: string | null, to: string | undefined) => {
@@ -531,6 +554,9 @@ router.put('/settings/defaults', async (req: Request, res: Response) => {
   note('bridge', before.bridge, parsed.data.bridge);
   note('isoStorage', before.isoStorage, parsed.data.isoStorage);
   note('backupStorage', before.backupStorage, parsed.data.backupStorage);
+  if (parsed.data.userPlacement !== undefined && parsed.data.userPlacement !== placementBefore) {
+    changes.push(`userPlacement: ${placementBefore} → ${parsed.data.userPlacement}`);
+  }
 
   await recordAudit({
     action: 'admin.settings_defaults',

@@ -234,9 +234,12 @@ export type PvePermissions = Record<string, Record<string, number>>;
  * `--privsep` defaulting to 1, and a least-privilege role that omitted `VM.Audit` —
  * showed up as empty lists while `/version` and `/nodes` answered happily.
  */
-export async function getEffectivePermissions(client?: AxiosInstance): Promise<PvePermissions> {
+export async function getEffectivePermissions(client?: AxiosInstance, path?: string): Promise<PvePermissions> {
   const c = client ?? (await getClient());
-  const res = await c.get<{ data: PvePermissions }>('/access/permissions');
+  // With `path`, Proxmox answers for that one path (ACL inheritance and `propagate`
+  // already applied) instead of dumping the whole tree.
+  const query = path ? `?${new URLSearchParams({ path }).toString()}` : '';
+  const res = await c.get<{ data: PvePermissions }>(`/access/permissions${query}`);
   return res.data.data ?? {};
 }
 
@@ -248,6 +251,31 @@ export async function getClusterVmCount(client?: AxiosInstance): Promise<number>
   const c = client ?? (await getClient());
   const res = await c.get<{ data: ClusterResource[] }>('/cluster/resources?type=vm');
   return (res.data.data ?? []).filter((r) => r.type === 'qemu' || r.type === 'lxc').length;
+}
+
+export interface PvePool {
+  poolid: string;
+  comment?: string;
+}
+
+/** Every resource pool (nested pools included, as `parent/child` ids). */
+export async function getPools(client?: AxiosInstance): Promise<PvePool[]> {
+  const c = client ?? (await getClient());
+  const res = await c.get<{ data: PvePool[] }>('/pools');
+  return res.data.data ?? [];
+}
+
+export interface PveVnet {
+  vnet: string;
+  zone?: string;
+  alias?: string;
+}
+
+/** Every SDN VNet, with its zone (a VNet is a bridge name to guests). */
+export async function getSdnVnets(client?: AxiosInstance): Promise<PveVnet[]> {
+  const c = client ?? (await getClient());
+  const res = await c.get<{ data: PveVnet[] }>('/cluster/sdn/vnets');
+  return res.data.data ?? [];
 }
 
 /**
@@ -746,6 +774,8 @@ export interface CreateVmConfig {
   bridge: string;
   isoStorage: string;
   iso: string; // ISO filename
+  /** Resource pool to create the guest in (Proxmox checks VM.Allocate on it). */
+  pool?: string;
 }
 
 /** Create a QEMU VM. Returns the Proxmox task UPID. */
@@ -766,6 +796,7 @@ export async function createVm(config: CreateVmConfig, client?: AxiosInstance): 
     ostype: 'l26',
     agent: '1',
   });
+  if (config.pool) params.set('pool', config.pool);
   const res = await c.post<{ data: string }>(`/nodes/${config.node}/qemu`, params);
   return res.data.data;
 }
@@ -786,6 +817,8 @@ export interface CreateLxcConfig {
   password?: string;
   sshPublicKeys?: string; // OpenSSH public key(s)
   unprivileged?: boolean; // default true
+  /** Resource pool to create the container in (Proxmox checks VM.Allocate on it). */
+  pool?: string;
 }
 
 /**
@@ -811,6 +844,7 @@ export async function createLxc(config: CreateLxcConfig, client?: AxiosInstance)
   });
   if (config.password) params.set('password', config.password);
   if (config.sshPublicKeys) params.set('ssh-public-keys', config.sshPublicKeys);
+  if (config.pool) params.set('pool', config.pool);
   const res = await c.post<{ data: string }>(`/nodes/${config.node}/lxc`, params);
   return res.data.data;
 }
@@ -1310,7 +1344,16 @@ export async function convertToTemplate(node: string, vmid: number, client?: Axi
 
 /** Clone a template into a new VM. Returns the Proxmox task UPID. */
 export async function cloneVm(
-  opts: { node: string; templateVmid: number; newVmid: number; name: string; full?: boolean; storage?: string },
+  opts: {
+    node: string;
+    templateVmid: number;
+    newVmid: number;
+    name: string;
+    full?: boolean;
+    storage?: string;
+    /** Resource pool for the clone (Proxmox checks VM.Allocate on it). */
+    pool?: string;
+  },
   client?: AxiosInstance,
 ): Promise<string> {
   const c = client ?? (await getClient());
@@ -1320,6 +1363,7 @@ export async function cloneVm(
     full: opts.full ? '1' : '0',
   });
   if (opts.full && opts.storage) params.set('storage', opts.storage);
+  if (opts.pool) params.set('pool', opts.pool);
   const res = await c.post<{ data: string }>(
     `/nodes/${opts.node}/qemu/${opts.templateVmid}/clone`,
     params,

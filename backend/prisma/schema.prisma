@@ -224,6 +224,13 @@ model VirtualMachine {
   name          String
   description   String?
 
+  // Where a Proxmox-scoped deploy put this guest: the resource pool (may be nested,
+  // e.g. `delfino/delfino-02`) and the NIC's bridge / SDN VNet. Null on everything
+  // deployed the classic way. Duplicates inherit these so a copy can never wander
+  // out of the zone its source was allowed into.
+  pool          String?
+  bridge        String?
+
   // Guest kind: "qemu" (full VM, the original + default) or "lxc" (container).
   // Drives the Proxmox API path segment and which features apply (LXC has no
   // live migration, data disks, or cloud-init extras).

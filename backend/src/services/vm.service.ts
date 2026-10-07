@@ -8,6 +8,7 @@ import { notify } from './notify.service.js';
 import { isMailConfigured, sendMail } from './mail.service.js';
 import { vmMaintenanceEmail } from '../lib/email-templates.js';
 import * as pve from './proxmox.service.js';
+import type { Placement } from './pve-scope.service.js';
 import { getOfferedFeatureIds, getBaseFeatureIds } from './template.service.js';
 import { isValidPublicKey } from './ssh-key.service.js';
 import { ALL_CAPS, CAPS_BY_ROLE, normalizeShareRole, type ShareRole, type VmCap } from './vm-share.service.js';
@@ -46,6 +47,11 @@ export interface CreateVmInput {
   quotaExempt?: boolean;
   /** Admin-only: the owning tenant may operate but not RESIZE this VM. */
   adminManaged?: boolean;
+  /**
+   * A placement ALREADY vetted by `resolvePlacement` for a confined actor. When
+   * present it replaces the server defaults (storage, bridge) and adds the resource pool.
+   */
+  placement?: Placement;
 }
 
 /** Check the requested resources against the user's remaining quota. */
@@ -112,16 +118,22 @@ export async function createVm(user: User, input: CreateVmInput): Promise<Virtua
   await assertWithinQuota(user, input);
 
   const client = await pve.getClient();
-  const [storage, bridge, isoStorage, isolationCfg] = await Promise.all([
+  const [defaultStorage, defaultBridge, isoStorage, isolationCfg] = await Promise.all([
     getConfig('default_storage'),
     getConfig('default_bridge'),
     getConfig('iso_storage'),
     getConfig('isolation_enabled'),
   ]);
+  const { placement } = input;
+  const storage = placement?.storage ?? defaultStorage;
+  const bridge = placement?.bridge ?? defaultBridge;
   if (!storage || !bridge || !isoStorage) {
     throw new Error('Server defaults are not configured — finish setup first');
   }
-  const isolate = isolationCfg !== 'false'; // tenant isolation is on by default
+  // Tenant isolation is on by default — but NOT for a scoped placement: the SDN zone the
+  // user was granted IS the isolation boundary there, and ProxMate's RFC1918 drop rules
+  // would cut the guest off from the very gamenet it was deployed to join.
+  const isolate = isolationCfg !== 'false' && !placement;
 
   // Only nodes that physically hold the install ISO can build this VM. With
   // node-local ISO storage (e.g. `local`), an ISO uploaded to one node isn't
@@ -171,6 +183,7 @@ export async function createVm(user: User, input: CreateVmInput): Promise<Virtua
       status: 'creating',
       quotaExempt: input.quotaExempt ?? false,
       adminManaged: input.adminManaged ?? false,
+      ...(placement ? { pool: placement.pool, bridge: placement.bridge } : {}),
     },
   });
 
@@ -189,6 +202,7 @@ export async function createVm(user: User, input: CreateVmInput): Promise<Virtua
         bridge,
         isoStorage,
         iso: input.os,
+        ...(placement ? { pool: placement.pool } : {}),
       },
       client,
     );
@@ -224,6 +238,8 @@ export interface CreateContainerInput {
   quotaExempt?: boolean;
   /** Admin-only: the owning tenant may operate but not RESIZE this container. */
   adminManaged?: boolean;
+  /** A placement already vetted by `resolvePlacement` (see CreateVmInput.placement). */
+  placement?: Placement;
 }
 
 /** Guess a container's CPU architecture from its OS-template filename. */
@@ -251,15 +267,18 @@ export async function createContainer(user: User, input: CreateContainerInput): 
   });
 
   const client = await pve.getClient();
-  const [storage, bridge, isolationCfg] = await Promise.all([
+  const [defaultStorage, defaultBridge, isolationCfg] = await Promise.all([
     getConfig('default_storage'),
     getConfig('default_bridge'),
     getConfig('isolation_enabled'),
   ]);
+  const { placement } = input;
+  const storage = placement?.storage ?? defaultStorage;
+  const bridge = placement?.bridge ?? defaultBridge;
   if (!storage || !bridge) {
     throw new Error('Server defaults are not configured — finish setup first');
   }
-  const isolate = isolationCfg !== 'false'; // tenant isolation is on by default
+  const isolate = isolationCfg !== 'false' && !placement; // see createVm: the zone is the boundary
 
   // Only nodes that physically hold the OS template can build this container
   // (node-local template storage like `local` isn't shared) — same constraint as
@@ -306,6 +325,7 @@ export async function createContainer(user: User, input: CreateContainerInput): 
       status: 'creating',
       quotaExempt: input.quotaExempt ?? false,
       adminManaged: input.adminManaged ?? false,
+      ...(placement ? { pool: placement.pool, bridge: placement.bridge } : {}),
     },
   });
 
@@ -323,6 +343,7 @@ export async function createContainer(user: User, input: CreateContainerInput): 
         ostemplate: input.template,
         password: input.password,
         sshPublicKeys: input.sshKey,
+        ...(placement ? { pool: placement.pool } : {}),
       },
       client,
     );
@@ -363,6 +384,8 @@ export interface DeployTemplateInput {
   quotaExempt?: boolean;
   /** Admin-only: the owning tenant may operate but not RESIZE this VM. */
   adminManaged?: boolean;
+  /** A placement already vetted by `resolvePlacement` (see CreateVmInput.placement). */
+  placement?: Placement;
 }
 
 /** Cloud-init knobs shared by template deploys and rebuilds. */
@@ -418,6 +441,8 @@ async function configureClonedVm(
     diskGb: number;
     isolate: boolean;
     cloud: CloudInitInput;
+    /** A scoped deploy's chosen bridge / VNet; absent = the admin's default applies. */
+    bridge?: string;
   },
   client: Awaited<ReturnType<typeof pve.getClient>>,
 ): Promise<void> {
@@ -518,7 +543,8 @@ async function configureClonedVm(
   // Network placement: the clone inherited the template's bridge, so the admin's
   // default is applied here or not at all. Before isolation, because placement is
   // what the firewall and VLAN rules are then written on top of.
-  await pve.applyDefaultBridge(node, vmid, client);
+  if (cfg.bridge) await pve.setVmBridge(node, vmid, cfg.bridge, client);
+  else await pve.applyDefaultBridge(node, vmid, client);
 
   // Tenant isolation (cloned NICs may lack the per-NIC firewall flag).
   if (isolate) {
@@ -549,8 +575,10 @@ async function planTemplateClone(
   node: string,
   template: Template,
   client: Awaited<ReturnType<typeof pve.getClient>>,
+  /** A scoped deploy's chosen storage; replaces the admin's default. */
+  storageOverride?: string,
 ): Promise<{ full: boolean; storage?: string }> {
-  const configured = (await getConfig('default_storage')) ?? undefined;
+  const configured = storageOverride ?? (await getConfig('default_storage')) ?? undefined;
   // The clone runs on the node holding the template, so a pool that node can't see
   // would fail the request. Don't trade a silently-ignored setting for a hard error.
   const storage = configured && (await pve.storageAvailableOn(node, configured, client))
@@ -601,7 +629,9 @@ export async function deployFromTemplate(
   });
 
   const client = await pve.getClient();
-  const isolate = (await getConfig('isolation_enabled')) !== 'false';
+  const { placement } = input;
+  // See createVm: a scoped placement is isolated by its SDN zone, not by ProxMate's firewall.
+  const isolate = (await getConfig('isolation_enabled')) !== 'false' && !placement;
 
   const node = template.proxmoxNode; // linked clone stays on the template's node
   const vmid = await pve.getNextVmId(client);
@@ -620,12 +650,18 @@ export async function deployFromTemplate(
       status: 'creating',
       quotaExempt: input.quotaExempt ?? false,
       adminManaged: input.adminManaged ?? false,
+      ...(placement ? { pool: placement.pool, bridge: placement.bridge } : {}),
     },
   });
 
   try {
     // Full-vs-linked and the target pool are decided together — see planTemplateClone.
-    const plan = await planTemplateClone(node, template, client);
+    if (placement && !(await pve.storageAvailableOn(node, placement.storage, client))) {
+      // The chosen storage isn't reachable from the template's node, so the clone would
+      // silently land somewhere the user never picked (and was never vetted for).
+      throw new Error(`Storage "${placement.storage}" isn't available on node "${node}", where this template lives.`);
+    }
+    const plan = await planTemplateClone(node, template, client, placement?.storage);
     const upid = await pve.cloneVm(
       {
         node,
@@ -634,6 +670,7 @@ export async function deployFromTemplate(
         name: input.name,
         full: plan.full,
         storage: plan.storage,
+        ...(placement ? { pool: placement.pool } : {}),
       },
       client,
     );
@@ -641,7 +678,7 @@ export async function deployFromTemplate(
 
     // Autoscale (cores/memory/disk) + cloud-init + tenant isolation on the clone.
     await configureClonedVm(
-      { node, vmid, template, cpu: input.cpu, ram: input.ram, diskGb, isolate, cloud: input },
+      { node, vmid, template, cpu: input.cpu, ram: input.ram, diskGb, isolate, cloud: input, bridge: placement?.bridge },
       client,
     );
 
@@ -698,7 +735,10 @@ export async function duplicateVm(source: VirtualMachine, newName: string): Prom
 
   const node = current.proxmoxNode;
   const vmid = await pve.getNextVmId(client);
-  const isolate = (await getConfig('isolation_enabled')) !== 'false';
+  // A guest deployed by a scoped account (it carries a pool) is copied INTO that same
+  // pool and bridge, and stays outside ProxMate's own firewall like its source did.
+  const scoped = Boolean(current.pool && current.bridge);
+  const isolate = (await getConfig('isolation_enabled')) !== 'false' && !scoped;
 
   const vm = await prisma.virtualMachine.create({
     data: {
@@ -714,6 +754,8 @@ export async function duplicateVm(source: VirtualMachine, newName: string): Prom
       os: current.os,
       tags: current.tags,
       status: 'creating',
+      pool: current.pool ?? null,
+      bridge: current.bridge ?? null,
     },
   });
 
@@ -721,19 +763,29 @@ export async function duplicateVm(source: VirtualMachine, newName: string): Prom
     // Full clone (not linked): storage-agnostic and self-contained, so the copy
     // survives the original being deleted — and, being full, it can be placed on
     // the admin's default pool instead of inheriting wherever the source sits.
-    const configured = (await getConfig('default_storage')) ?? undefined;
+    // A scoped copy stays on the source's storage (the one its owner was vetted for).
+    const configured = scoped ? undefined : ((await getConfig('default_storage')) ?? undefined);
     const storage = configured && (await pve.storageAvailableOn(node, configured, client))
       ? configured
       : undefined;
     const upid = await pve.cloneVm(
-      { node, templateVmid: current.proxmoxVmId, newVmid: vmid, name: newName, full: true, storage },
+      {
+        node,
+        templateVmid: current.proxmoxVmId,
+        newVmid: vmid,
+        name: newName,
+        full: true,
+        storage,
+        ...(current.pool ? { pool: current.pool } : {}),
+      },
       client,
     );
     await pve.waitForTask(node, upid, client, 600_000);
 
     // Same as every other clone path: the copy inherited the source's bridge, so the
-    // admin's default is applied here (see pve.applyDefaultBridge for why it wins).
-    await pve.applyDefaultBridge(node, vmid, client);
+    // admin's default is applied here (see pve.applyDefaultBridge for why it wins) —
+    // except for a scoped guest, whose bridge IS its zone and must be kept.
+    if (!scoped) await pve.applyDefaultBridge(node, vmid, client);
 
     if (isolate) {
       await pve.configureVmIsolation(node, vmid, await pve.readIsolationOptions(), client);
@@ -1293,6 +1345,12 @@ export async function rebuildVm(
   vm: VirtualMachine,
   source: RebuildSource,
 ): Promise<VirtualMachine> {
+  // A rebuild deletes the guest and re-provisions it from SERVER DEFAULTS — which would
+  // drop it out of its pool and onto the default bridge. Refuse BEFORE anything is
+  // destroyed rather than quietly relocate a guest out of the zone it was granted.
+  if (vm.pool || vm.bridge) {
+    throw new Error("Rebuilding isn't supported for machines deployed into a Proxmox pool yet — deploy a new one instead.");
+  }
   const client = await pve.getClient();
   const current = await syncVmNode(vm);
   const vmid = current.proxmoxVmId;

@@ -1,0 +1,63 @@
+# Optional: builds the backend against PostgreSQL instead of the default SQLite
+# (see docs/api.md's "Running on PostgreSQL" section — a documented, supported
+# configuration: all of ProxMate's queries go through Prisma, no SQLite-specific
+# SQL, so the app code itself is portable). Only the datasource + migration
+# history need patching at build time.
+#
+# FOR A FRESH DATABASE ONLY — this replaces the migration history with a single
+# baseline generated from the schema; don't point it at a populated SQLite install.
+#
+# Build with context = backend/ (same as the stock Dockerfile):
+#   docker build -f deploy/Dockerfile.backend.postgres -t <tag> backend
+
+FROM node:20-alpine AS build
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY prisma ./prisma
+COPY src ./src
+
+RUN sed -i \
+  's/provider = "sqlite"/provider = "postgresql"/w /tmp/sed_changed_provider.txt' \
+  prisma/schema.prisma \
+  && [ -s /tmp/sed_changed_provider.txt ] || { echo "ERROR: sed pattern did not match, patch may be outdated"; exit 1; }
+
+# The existing prisma/migrations/*/migration.sql files are frozen SQLite-dialect
+# SQL; `prisma migrate deploy` replays them VERBATIM at runtime, so they would
+# fail immediately against a real Postgres server. `--from-empty` needs no live
+# DB connection, so this works entirely at build time.
+RUN rm -rf prisma/migrations \
+ && mkdir -p prisma/migrations/00000000000000_init \
+ && npx prisma migrate diff \
+      --from-empty \
+      --to-schema-datamodel prisma/schema.prisma \
+      --script > prisma/migrations/00000000000000_init/migration.sql \
+ && [ -s prisma/migrations/00000000000000_init/migration.sql ]
+
+RUN npx prisma generate \
+ && npm run build \
+ && npm prune --omit=dev \
+ && npx prisma generate
+
+FROM node:20-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+
+RUN apk add --no-cache su-exec
+
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/prisma ./prisma
+COPY package.json ./
+COPY docker-entrypoint.sh ./
+RUN chmod +x docker-entrypoint.sh
+
+EXPOSE 4000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||4000)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+ENTRYPOINT ["./docker-entrypoint.sh"]
