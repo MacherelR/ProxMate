@@ -95,6 +95,38 @@ services:
       # defaults: guest backups Sundays 03:00, access-expiry sweep hourly at :20.
       MATESTATE_CRON: ${MATESTATE_CRON:-}
       ACCESS_EXPIRY_CRON: ${ACCESS_EXPIRY_CRON:-}
+      # Optional: skip the interactive /setup wizard — see DEPLOYMENT.md §7.1a. False
+      # (the default) leaves the wizard as the only path; when true, the ADMIN_*/
+      # PROXMOX_*/DEFAULT_* vars below are required and read ONCE, on the first boot
+      # that completes setup — ignored forever after, including if later changed.
+      PROXMATE_AUTO_SETUP: ${PROXMATE_AUTO_SETUP:-false}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_DISPLAY_NAME: ${ADMIN_DISPLAY_NAME:-}
+      PROXMOX_HOST: ${PROXMOX_HOST:-}
+      PROXMOX_TOKEN_ID: ${PROXMOX_TOKEN_ID:-}
+      PROXMOX_TOKEN_SECRET: ${PROXMOX_TOKEN_SECRET:-}
+      PROXMOX_VERIFY_SSL: ${PROXMOX_VERIFY_SSL:-}
+      DEFAULT_STORAGE: ${DEFAULT_STORAGE:-}
+      DEFAULT_BRIDGE: ${DEFAULT_BRIDGE:-}
+      DEFAULT_ISO_STORAGE: ${DEFAULT_ISO_STORAGE:-}
+      DEFAULT_BACKUP_STORAGE: ${DEFAULT_BACKUP_STORAGE:-}
+      # Optional, independent of the above: configure SSO as part of the same first-boot
+      # run — see DEPLOYMENT.md §7.1a. Setting SSO_ISSUER/SSO_CLIENT_ID opts in; both
+      # (plus SSO_CLIENT_SECRET) are then required.
+      SSO_ISSUER: ${SSO_ISSUER:-}
+      SSO_CLIENT_ID: ${SSO_CLIENT_ID:-}
+      SSO_CLIENT_SECRET: ${SSO_CLIENT_SECRET:-}
+      SSO_ENABLED: ${SSO_ENABLED:-}
+      SSO_GROUPS_CLAIM: ${SSO_GROUPS_CLAIM:-}
+      SSO_ADMIN_GROUP: ${SSO_ADMIN_GROUP:-}
+      SSO_ALLOW_SIGNUP: ${SSO_ALLOW_SIGNUP:-}
+      SSO_SCOPES: ${SSO_SCOPES:-}
+      SSO_BUTTON_LABEL: ${SSO_BUTTON_LABEL:-}
+      SSO_ACCESS_ROLES: ${SSO_ACCESS_ROLES:-}
+      SSO_NEW_USER_CPU: ${SSO_NEW_USER_CPU:-}
+      SSO_NEW_USER_RAM: ${SSO_NEW_USER_RAM:-}
+      SSO_NEW_USER_STORAGE: ${SSO_NEW_USER_STORAGE:-}
     # Report healthy only once /api/health passes (DB reachable + migrations run),
     # so the frontend can wait for a genuinely-ready backend (see depends_on below).
     healthcheck:

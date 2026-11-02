@@ -58,6 +58,7 @@ import { announcementEmail } from '../lib/email-templates.js';
 import { unsubscribeToken } from '../services/broadcast-optout.service.js';
 import { getNotifyConfig, saveNotifyConfig, sendTestNotification, NOTIFY_EVENTS } from '../services/notify.service.js';
 import * as sso from '../services/sso.service.js';
+import { SsoSchema } from '../services/sso.service.js';
 import { resetScopeCache } from '../services/pve-scope.service.js';
 import { getIdeConfig, saveIdeConfig, isValidIngressCidr } from '../services/ide.service.js';
 import { probeIdeReachability } from '../services/ide-provision.service.js';
@@ -94,7 +95,7 @@ router.get('/audit', async (req: Request, res: Response) => {
 // Returns current config (never the Proxmox token secret).
 
 router.get('/settings', async (_req: Request, res: Response) => {
-  const [host, tokenId, verifySsl, storage, bridge, isoStorage, backupStorage, rescueIso, templateRefresh, userPlacement] = await Promise.all([
+  const [host, tokenId, verifySsl, storage, bridge, isoStorage, backupStorage, rescueIso, templateRefresh, userPlacement, isoAdminOnly] = await Promise.all([
     getConfig('proxmox_host'),
     getConfig('proxmox_token_id'),
     getConfig('proxmox_verify_ssl'),
@@ -105,13 +106,14 @@ router.get('/settings', async (_req: Request, res: Response) => {
     getConfig('rescue_iso'),
     getConfig('template_refresh_enabled'),
     getConfig('pve_user_placement'),
+    getConfig('iso_admin_only'),
   ]);
 
   const mail = await getMailConfig();
   const ssoCfg = await sso.getSsoConfig();
   res.json({
     proxmox: { host, tokenId, verifySsl: verifySsl === 'true', hasSecret: !!(await getConfig('proxmox_token_secret')) },
-    defaults: { storage, bridge, isoStorage, backupStorage, userPlacement: userPlacement === 'true' },
+    defaults: { storage, bridge, isoStorage, backupStorage, userPlacement: userPlacement === 'true', isoAdminOnly: isoAdminOnly === 'true' },
     rescueIso,
     templateRefreshEnabled: templateRefresh === 'true',
     smtp: mail
@@ -404,25 +406,6 @@ router.post('/ide/test-reachability', async (req: Request, res: Response) => {
 
 // ─── SSO (OIDC) settings ──────────────────────────────────────
 
-const SsoSchema = z.object({
-  enabled: z.boolean().default(false),
-  issuer: z.string().url('Issuer must be a valid URL'),
-  clientId: z.string().min(1),
-  clientSecret: z.string().optional(), // kept if blank
-  scopes: z.string().optional(),
-  groupsClaim: z.string().optional(),
-  adminGroup: z.string().optional(),
-  allowSignup: z.boolean().optional(),
-  buttonLabel: z.string().optional(),
-  // Roles/groups (comma-separated) of which a non-admin user must hold at least one to
-  // sign in to THIS instance. Blank = no gate.
-  accessRoles: z.string().max(1000).optional(),
-  // Quota handed to newly provisioned SSO users (0 = none).
-  newUserCpu: z.number().int().min(0).max(1024).optional(),
-  newUserRam: z.number().int().min(0).max(4_194_304).optional(),
-  newUserStorage: z.number().int().min(0).max(1_048_576).optional(),
-});
-
 router.put('/settings/sso', async (req: Request, res: Response) => {
   const parsed = SsoSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -521,6 +504,9 @@ const DefaultsSchema = z.object({
   // Non-admin users choose a pool / network / storage from what the Proxmox account may
   // use, instead of the defaults above (see pve-scope.service.ts). Omitted = unchanged.
   userPlacement: z.boolean().optional(),
+  // Hide "install from ISO" in the wizard for non-admins, and refuse it on the API too
+  // (see vm.service.ts's assertMayInstallFromIso). Omitted = unchanged.
+  isoAdminOnly: z.boolean().optional(),
 });
 
 router.put('/settings/defaults', async (req: Request, res: Response) => {
@@ -540,10 +526,14 @@ router.put('/settings/defaults', async (req: Request, res: Response) => {
     backupStorage: await getConfig('backup_storage'),
   };
   const placementBefore = (await getConfig('pve_user_placement')) === 'true';
+  const isoAdminOnlyBefore = (await getConfig('iso_admin_only')) === 'true';
   await saveDefaults(parsed.data);
   if (parsed.data.userPlacement !== undefined) {
     await setConfig('pve_user_placement', String(parsed.data.userPlacement));
     resetScopeCache();
+  }
+  if (parsed.data.isoAdminOnly !== undefined) {
+    await setConfig('iso_admin_only', String(parsed.data.isoAdminOnly));
   }
 
   const changes: string[] = [];
@@ -556,6 +546,9 @@ router.put('/settings/defaults', async (req: Request, res: Response) => {
   note('backupStorage', before.backupStorage, parsed.data.backupStorage);
   if (parsed.data.userPlacement !== undefined && parsed.data.userPlacement !== placementBefore) {
     changes.push(`userPlacement: ${placementBefore} → ${parsed.data.userPlacement}`);
+  }
+  if (parsed.data.isoAdminOnly !== undefined && parsed.data.isoAdminOnly !== isoAdminOnlyBefore) {
+    changes.push(`isoAdminOnly: ${isoAdminOnlyBefore} → ${parsed.data.isoAdminOnly}`);
   }
 
   await recordAudit({

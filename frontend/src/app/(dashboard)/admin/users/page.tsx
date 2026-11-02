@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
-import { Trash2, KeyRound, Loader2, RefreshCw, Save, Check, X, Cpu } from "lucide-react";
+import { Trash2, KeyRound, Loader2, RefreshCw, Save, Check, X, Cpu, Pencil } from "lucide-react";
 import { api, apiError } from "@/lib/api";
 import { useAuthStore } from "@/lib/auth-store";
 import { cn } from "@/lib/utils";
@@ -529,6 +529,13 @@ function EditQuotaDialog({ user, onDone }: { user: ManagedUser; onDone: () => vo
           <button type="button" className="text-left font-medium hover:underline" title="Edit profile & quota">
             {user.displayName}
           </button>
+        }
+      />
+      <AlertDialogTrigger
+        render={
+          <Button size="sm" variant="ghost" title="Edit quota">
+            <Pencil />
+          </Button>
         }
       />
       <AlertDialogContent>

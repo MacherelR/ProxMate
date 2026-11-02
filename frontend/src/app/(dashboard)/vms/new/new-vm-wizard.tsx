@@ -105,6 +105,9 @@ export default function NewVmWizard() {
   // Placement: this account must choose where a machine goes, from what the instance's
   // Proxmox account can use. `pveScoped` comes from /auth/me; `scope` is what it offers.
   const [pveScoped, setPveScoped] = useState(false);
+  // Server-side "install from ISO" restriction (admin-only). True for admins always;
+  // the create route enforces this regardless of what the wizard shows.
+  const [isoInstallAllowed, setIsoInstallAllowed] = useState(true);
   const [scope, setScope] = useState<PveScopeResponse | null>(null);
   const [scopeError, setScopeError] = useState<string | null>(null);
   const [placePool, setPlacePool] = useState("");
@@ -165,6 +168,8 @@ export default function NewVmWizard() {
     ])
       .then(([meRes, isosRes, tplRes, extrasRes, keysRes, lxcRes, restoreRes, scopeRes]) => {
         const scoped = meRes.data.user.pveScoped === true;
+        const isoAllowedNow = meRes.data.user.isoInstallAllowed !== false;
+        setIsoInstallAllowed(isoAllowedNow);
         const granted = scopeRes.data.scoped ? scopeRes.data : null;
         setPveScoped(scoped);
         setScope(scopeRes.data);
@@ -180,15 +185,18 @@ export default function NewVmWizard() {
         setLxcTemplates(lxcRes.data ?? []);
         setRestoreEnabled(restoreRes.data.enabled === true);
 
-        // A scoped account starts on something it may actually use (never on an ISO
-        // install it has no rights for).
-        if (scoped && granted && !granted.isoAllowed) {
-          const firstTemplate = tplRes.data.find((t) => granted.templateIds.includes(t.id));
+        // Never default to an ISO install this account can't actually use — whether
+        // because the server restricts ISO installs to admins, or (separately) because
+        // a scoped account's Proxmox rights don't cover the configured ISO storage.
+        const isoBlocked = !isoAllowedNow || (scoped && granted && !granted.isoAllowed);
+        if (isoBlocked) {
+          const eligibleTemplates = granted ? tplRes.data.filter((t) => granted.templateIds.includes(t.id)) : tplRes.data;
+          const firstTemplate = eligibleTemplates[0];
           if (firstTemplate) {
             setSource(firstTemplate.id);
             setStorageGb(Math.max(firstTemplate.diskGb, 1));
             if (firstTemplate.cloudInit) setUsername(cloudUserForOs(firstTemplate.os));
-          } else if (granted.lxcAllowed) {
+          } else if (!granted || granted.lxcAllowed) {
             setSource(CONTAINER);
             setStorageGb(CONTAINER_DISK_DEFAULT);
           }
@@ -212,13 +220,13 @@ export default function NewVmWizard() {
   const scopeOpts = pveScoped && scope?.scoped ? scope : null;
   // A scoped account sees only the templates Proxmox lets it clone.
   const visibleTemplates = scopeOpts ? templates.filter((t) => scopeOpts.templateIds.includes(t.id)) : templates;
-  const showIso = !scopeOpts || scopeOpts.isoAllowed;
+  const showIso = isoInstallAllowed && (!scopeOpts || scopeOpts.isoAllowed);
   const showContainer = !scopeOpts || scopeOpts.lxcAllowed;
   // A container's rootfs needs `rootdir` storage; a VM disk needs `images`.
   const storageOptions = scopeOpts
     ? scopeOpts.storages.filter((st) => (st.content ?? "").split(",").includes(isContainer ? "rootdir" : "images"))
     : [];
-  const nothingToDeploy = !!scopeOpts && !showIso && !showContainer && visibleTemplates.length === 0;
+  const nothingToDeploy = !showIso && !showContainer && visibleTemplates.length === 0;
   const template =
     source === CUSTOM || isContainer || isRestore ? null : templates.find((t) => t.id === source) ?? null;
   const isCustom = source === CUSTOM;
@@ -517,8 +525,9 @@ export default function NewVmWizard() {
 
                 {nothingToDeploy && (
                   <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
-                    This environment&apos;s Proxmox account has no pool, network and storage (or template) to
-                    deploy from yet. Ask an administrator to check its permissions.
+                    {scopeOpts
+                      ? "This environment's Proxmox account has no pool, network and storage (or template) to deploy from yet. Ask an administrator to check its permissions."
+                      : "There's nothing available to deploy from yet — no published templates, no container templates, and ISO installs aren't offered to this account. Ask an administrator to publish a template."}
                   </div>
                 )}
 

@@ -222,6 +222,88 @@ Browse to **https://proxmate.example.com** — you should land on the setup wiza
 3. Set **VM defaults** (storage, bridge — point this at your tenant VLAN/VNet if you
    made one, ISO storage).
 
+> **Scripting a deployment (CI/CD, Ansible, Terraform)?** §7.1a below skips this wizard
+> entirely via environment variables.
+
+### 7.1a Automatic first-time setup (skip the wizard)
+
+Set these before the first boot and the backend walks the wizard itself — creates the
+admin, saves and verifies the Proxmox connection, checks the defaults against the live
+cluster, and finishes setup — with nothing to click through:
+
+| Variable | Required | Notes |
+|---|---|---|
+| `PROXMATE_AUTO_SETUP` | — | Must be exactly `true`. Any other value (including unset) leaves the interactive wizard as the only path — nothing else below has any effect. |
+| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | yes | The owner account. Password 8+ characters, same rule as the wizard. |
+| `ADMIN_DISPLAY_NAME` | no | Default `Administrator`. |
+| `PROXMOX_HOST`, `PROXMOX_TOKEN_ID`, `PROXMOX_TOKEN_SECRET` | yes | Same values as step 7.1.2 above. |
+| `PROXMOX_VERIFY_SSL` | no | Default `true`. Only the exact string `false` turns verification off — anything else (including a typo) stays strict. |
+| `DEFAULT_STORAGE`, `DEFAULT_BRIDGE`, `DEFAULT_ISO_STORAGE` | yes | Same as step 7.1.3. Each is checked against what the token can actually see on the cluster — a typo refuses setup by name, not a vague "server defaults are not configured" later. |
+| `DEFAULT_BACKUP_STORAGE` | no | Not offered by the interactive wizard at all; auto-setup can set it on first boot. |
+
+```yaml
+# docker-compose .env, or the backend service's `environment:` directly
+PROXMATE_AUTO_SETUP=true
+ADMIN_EMAIL=admin@example.com
+ADMIN_PASSWORD=change-me-now
+PROXMOX_HOST=https://192.168.1.100:8006
+PROXMOX_TOKEN_ID=root@pam!proxmate
+PROXMOX_TOKEN_SECRET=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+DEFAULT_STORAGE=local-zfs
+DEFAULT_BRIDGE=vmbr0
+DEFAULT_ISO_STORAGE=local
+```
+
+**What to expect:**
+- **Idempotent.** Runs on every container start, but `isSetupComplete()` is checked
+  first — once setup finishes, this permanently becomes a no-op for that database, even
+  if the env vars are left in place or changed. It will never re-apply itself over
+  settings an admin later changes by hand in the UI.
+- **Resumable — but only for its own admin.** If the container is killed partway
+  through (admin created, Proxmox not yet saved), the next boot picks up where it left
+  off rather than failing with "Admin account already exists". If an admin already
+  exists for a DIFFERENT reason — the interactive wizard was used once before
+  `PROXMATE_AUTO_SETUP` was set, or `ADMIN_EMAIL` changed between attempts — this
+  refuses with a clear error instead of silently treating it as its own (that account's
+  password is unknown here). Match `ADMIN_EMAIL` to the existing account, or delete it,
+  to proceed. Left unresolved, `/setup` would otherwise sit stuck showing step 2 forever
+  — the UI sees `adminExists: true` but `setupComplete` never becomes `true`.
+- **Fails closed, on purpose.** A bad token, an unreachable host, or a storage/bridge
+  name that doesn't exist on the cluster makes the container exit non-zero instead of
+  completing setup against a broken connection. Under `restart: unless-stopped` that
+  means it crash-loops — self-healing if Proxmox simply isn't up yet during
+  orchestrated provisioning, loud if the input is actually wrong. Check
+  `docker compose logs backend` for the `[auto-setup]`-prefixed line naming exactly
+  what's missing or wrong.
+- These are the same validations and the same `/access/permissions`-based connection
+  check as the interactive wizard's "Test" button — nothing about auto-setup is less
+  strict.
+
+**Also configure SSO, as part of the same run** — set `SSO_ISSUER` + `SSO_CLIENT_ID` (+
+`SSO_CLIENT_SECRET`, required alongside them even though the admin UI itself allows
+leaving a secret blank on an *ongoing* update — a first-time configure with none stored
+yet would just leave SSO broken). Saved with the exact function the admin UI's "Save SSO
+settings" button calls, so there's no separate, weaker path:
+
+```yaml
+SSO_ISSUER=https://idp.example.com/realms/example
+SSO_CLIENT_ID=proxmate
+SSO_CLIENT_SECRET=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+SSO_GROUPS_CLAIM=roles
+SSO_ADMIN_GROUP=proxmate-admins
+```
+
+| Variable | Required | Notes |
+|---|---|---|
+| `SSO_ISSUER`, `SSO_CLIENT_ID` | — | Setting either opts in; both are then required, along with `SSO_CLIENT_SECRET`. Neither set: SSO is left exactly as the wizard would leave it (unconfigured). |
+| `SSO_CLIENT_SECRET` | yes, once opted in | See above — required here even though the admin UI allows blank on a later update. |
+| `SSO_ENABLED` | no | Default `true` — configuring it at all is taken as wanting it on. Set to the exact string `false` to save it staged but disabled. |
+| `SSO_GROUPS_CLAIM` | no | ID-token claim read for group/role membership. ProxMate's own default (unset here) is `groups`. |
+| `SSO_ADMIN_GROUP` | no | Membership promotes to admin on login (never auto-demotes). **Only takes effect for a brand-new account if `SSO_ALLOW_SIGNUP=true` too** — otherwise a user with no existing account is refused before the admin-group check runs. |
+| `SSO_ALLOW_SIGNUP` | no | Default `false` (ProxMate's own base default) — auto-provisioning brand-new accounts widens who can reach this ProxMate, so it stays off unless the exact string `true` is set. |
+| `SSO_SCOPES`, `SSO_BUTTON_LABEL`, `SSO_ACCESS_ROLES` | no | Same meaning as the admin UI's SSO card. |
+| `SSO_NEW_USER_CPU`, `SSO_NEW_USER_RAM`, `SSO_NEW_USER_STORAGE` | no | Default `0` (none) — quota for a newly auto-provisioned SSO user. |
+
 ### 7.2 Smoke-test the core
 - Dashboard shows live cluster capacity (admins see cluster stats).
 - Create a tiny test VM (or deploy from a template / cloud-init image) → start →
@@ -340,6 +422,15 @@ guessing. Answers are cached for 30 seconds. Admins keep the classic defaults.
   **Rebuild** and **restore from upload** are unavailable (both re-provision from server defaults).
 - Quotas still apply on top. A newly auto-created SSO user gets the *quota for auto-created SSO
   users* configured in the same card (0 = none, so they cannot deploy until you raise it).
+
+**Restrict ISO installs to admins** — Settings ▸ Proxmox ▸ *Only admins may install from ISO*. A
+non-admin's ISO picker otherwise shows everything Proxmox classifies as `content=iso` on the
+configured ISO storage — which includes OTHER GUESTS' OWN cloud-init seed volumes (a NoCloud
+datasource is itself an ISO9660 image, so Proxmox tags it `content=iso` too), not just genuinely
+shared install media. On a cluster where ISO storage is shared across tenants, that can mean
+seeing — and being able to attach — another tenant's cloud-init seed. Turning this on hides
+"Custom VM (install from ISO)" in the wizard for non-admins and refuses it on `POST /api/vms` too,
+so it's a real restriction, not a hidden button; templates and containers are unaffected.
 
 ---
 
@@ -668,6 +759,7 @@ then read `/var/backups/proxmate`. See §12.
 | Wizard shows empty Pool/Network/Storage lists | The Proxmox account holds `VM.Allocate` / `SDN.Use` / `Datastore.AllocateSpace` on nothing that exists yet — fix its ACLs; use Settings ▸ Proxmox ▸ Test. |
 | SSO: discovery/Test fails | Issuer must serve `/.well-known/openid-configuration`; check the client secret and that the realm name is right. |
 | Proxmox storage empty / VM create 403 | Token has **Privilege Separation ON** — recreate with `--privsep 0` (§2.2). |
+| Container crash-loops right after a fresh deploy, log shows `[auto-setup] …` | `PROXMATE_AUTO_SETUP=true` (§7.1a) found a bad input — the line names exactly which var and why (unreachable host, bad token, or a storage/bridge/ISO storage that doesn't exist on the cluster). Fix the var and restart; it resumes rather than redoing finished steps. |
 | Rate-limit/audit shows the proxy IP, not the client | Set `TRUST_PROXY=1` (already in the production `.env`). |
 | Console (noVNC) won't connect | Ensure the reverse proxy forwards WebSocket upgrades on `/api/*` (Caddy does automatically). |
 | Changed `NEXT_PUBLIC_API_URL` but the browser still calls the old URL | Rebuild the frontend image: `docker compose up -d --build frontend`. |

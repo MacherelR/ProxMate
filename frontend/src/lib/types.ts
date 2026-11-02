@@ -47,6 +47,12 @@ export interface MeResponse {
      * the create wizard; the API enforces the same rule regardless.
      */
     pveScoped?: boolean;
+    /**
+     * False when the "install from ISO" wizard option is hidden for this account
+     * (admin-only server setting). Always true for admins. The create route enforces
+     * this regardless of what the wizard shows.
+     */
+    isoInstallAllowed?: boolean;
   };
 }
 
@@ -468,6 +474,8 @@ export interface AdminSettings {
     backupStorage: string | null;
     /** Non-admin users choose a pool / network / storage the Proxmox account can use. */
     userPlacement: boolean;
+    /** Hide "install from ISO" in the wizard for non-admins (and refuse it on the API). */
+    isoAdminOnly: boolean;
   };
   smtp:
     | { configured: false }

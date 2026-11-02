@@ -1,9 +1,35 @@
 import { randomBytes } from 'node:crypto';
+import { z } from 'zod';
 import * as oidc from 'openid-client';
 import { prisma } from '../lib/prisma.js';
 import { getConfig, setConfig } from './config.service.js';
 import { hashPassword } from './auth.service.js';
 import type { User } from '@prisma/client';
+
+/**
+ * Shape + validation for admin-configured SSO settings, SHARED between the interactive
+ * HTTP route (admin.routes.ts) and the non-interactive `auto-setup` script (env-var
+ * driven) — one definition, so the two can't drift the way AdminSchema/
+ * ProxmoxConfigSchema/DefaultsSchema already don't for the base OOBE steps.
+ */
+export const SsoSchema = z.object({
+  enabled: z.boolean().default(false),
+  issuer: z.string().url('Issuer must be a valid URL'),
+  clientId: z.string().min(1),
+  clientSecret: z.string().optional(), // kept if blank
+  scopes: z.string().optional(),
+  groupsClaim: z.string().optional(),
+  adminGroup: z.string().optional(),
+  allowSignup: z.boolean().optional(),
+  buttonLabel: z.string().optional(),
+  // Roles/groups (comma-separated) of which a non-admin user must hold at least one to
+  // sign in to THIS instance. Blank = no gate.
+  accessRoles: z.string().max(1000).optional(),
+  // Quota handed to newly provisioned SSO users (0 = none).
+  newUserCpu: z.number().int().min(0).max(1024).optional(),
+  newUserRam: z.number().int().min(0).max(4_194_304).optional(),
+  newUserStorage: z.number().int().min(0).max(1_048_576).optional(),
+});
 
 /** Admin-facing SSO settings (never includes the client secret). */
 export interface SsoConfig {

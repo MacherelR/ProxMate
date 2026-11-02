@@ -14,6 +14,13 @@
 - Cloud-image templates built by ProxMate now include `qemu-guest-agent`. The importer converted the downloaded image to a template without booting it, so no package could be installed — and since login passwords are applied through the agent, those templates could not serve a password-only deploy. The build boots the image once, installs and verifies the agent, clears the cloud-init cache and build logs, then converts. A build without network access still produces a usable template, recorded as agentless and flagged in Template Store.
 - `deploy.agent_missing` notification when a deploy's guest agent never responds. Previously the only signals were a log line and a tenant unable to log in.
 - `GET /api/admin/storage-pinning` lists guests that cannot migrate, using Proxmox's own migration preflight.
+- The `/setup` wizard no longer gets stuck on step 2 after a fresh install on a browser that previously completed setup on the same domain. The locally cached `user` (localStorage, for instant UI) was trusted for routing without confirming the session cookie still verifies — a reset backend (new database, new `jwt_secret`) left the wizard reading a stale "I'm logged in" from the browser and skipping straight past admin creation, with no admin actually in the new database. It now re-checks `/auth/me` before trusting that cache.
+- The "Default bridge" picker (OOBE step 3 and `GET /api/setup/proxmox/resources`) now also lists SDN VNets, not only classic Linux bridges. A cluster whose guest networking is entirely SDN-based had nothing to pick at all — verified live against a real cluster: three real VNets visible to the token, "Available: (none visible to this token)" shown anyway, because the lookup only ever asked one node for `type=bridge` interfaces. A VNet is exactly as valid a `net0: bridge=<name>` value as a classic bridge, so the two lists are merged (deduped by name); a cluster with no SDN configured at all is unaffected.
+- The install-ISO picker no longer shows other guests' own cdrom volumes alongside real install media. Proxmox's `content=iso` filter also returns guest-owned volumes on the ISO storage — most commonly another VM's cloud-init seed, which is itself genuinely an ISO9660 image. Verified live on a shared ISO storage: every other tenant's cloud-init seed appeared in the dropdown. Now filtered to the `<storage>:iso/<file>` shared-library path `createVm()` itself already relies on; anything under a guest's own vmid-prefixed path is excluded.
+
+## Only admins may install from ISO
+
+New admin setting (Settings ▸ Proxmox, off by default): hides "Custom VM (install from ISO)" in the create wizard for non-admin users and refuses it on `POST /api/vms` too — a real restriction, not a hidden button. Templates and containers are unaffected, so an operator can steer tenants toward curated templates while keeping raw ISO installs (and the unattended-installer attack surface) admin-only. `GET /api/auth/me`'s new `isoInstallAllowed` drives the wizard; `assertMayInstallFromIso` is the one enforcement point, asserted by a source-scan test.
 
 ## One instance per environment
 
@@ -24,6 +31,15 @@ ProxMate can now be pinned to a single environment. Isolation comes from two lay
 - New guests record their pool and network; duplicates stay in the same pool and network. Rebuild and restore-from-upload are refused while placement is on, because both re-provision from server defaults.
 - Placed machines skip ProxMate's own tenant firewall and VLAN tag; the granted SDN zone is the boundary.
 - Auto-created SSO users can be given a default quota (previously always zero).
+
+## Automatic first-time setup
+
+`PROXMATE_AUTO_SETUP=true` (+ `ADMIN_EMAIL`/`ADMIN_PASSWORD`, `PROXMOX_HOST`/`PROXMOX_TOKEN_ID`/`PROXMOX_TOKEN_SECRET`, `DEFAULT_STORAGE`/`DEFAULT_BRIDGE`/`DEFAULT_ISO_STORAGE`) walks the `/setup` wizard from environment variables — for scripted deployments (Ansible, Terraform, CI) that shouldn't need a human to click through it. See `DEPLOYMENT.md` §7.1a.
+
+- Same validation and the same `/access/permissions`-based connection check as the interactive wizard's "Test" button — nothing about this path is less strict.
+- Idempotent and resumable: runs on every boot but is a permanent no-op once setup completes, and picks up correctly after a crash partway through (e.g. admin created, Proxmox not yet saved) instead of failing on "Admin account already exists".
+- Fails closed: a bad token or a storage/bridge/ISO-storage name that doesn't exist on the live cluster exits non-zero instead of completing setup against a broken configuration.
+- Optionally also configures SSO as part of the same run: `SSO_ISSUER` + `SSO_CLIENT_ID` (+ `SSO_CLIENT_SECRET`, required alongside them even though the admin UI allows it blank on a later update) opt in, saved with the exact function the admin UI's "Save SSO settings" button calls. `SsoSchema` moved into `sso.service.ts` (same refactor as `AdminSchema`/`ProxmoxConfigSchema`/`DefaultsSchema`) so the HTTP route and this script share one definition.
 
 ## Modules
 

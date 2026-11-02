@@ -44,6 +44,7 @@ import {
   ResizeError,
   CreateOptionError,
   resolveCreateTarget,
+  assertMayInstallFromIso,
   createVm,
   createContainer,
   kindOf,
@@ -202,6 +203,9 @@ router.post('/', async (req: Request, res: Response) => {
 
   const actor = (req as AuthRequest).user;
   try {
+    // Checked before anything else: an ISO install the server refuses must never get
+    // far enough to reserve a VMID or touch Proxmox.
+    await assertMayInstallFromIso(actor);
     // The guest's OWNER (the acting user, or the admin's chosen tenant) — quota
     // applies to them; node/forUserId/quotaExempt are admin-only options.
     const owner = await resolveCreateTarget(actor, parsed.data);

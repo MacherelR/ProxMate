@@ -26,6 +26,47 @@ async function markVmError(vmId: string, name: string, err: unknown): Promise<vo
   }).catch(() => undefined);
 }
 
+/** Whether a guest actually exists on Proxmox — denied and absent look the same here, and matter the same way. */
+async function existsOnProxmox(
+  node: string,
+  vmid: number,
+  client: Awaited<ReturnType<typeof pve.getClient>>,
+  kind: pve.GuestKind = 'qemu',
+): Promise<boolean> {
+  return (await pve.getVmStatus(node, vmid, client, kind).catch(() => null)) !== null;
+}
+
+/**
+ * Handle a failed FRESH deploy (create/clone — never a rebuild, whose row predates the
+ * attempt and must survive it regardless). When the create/clone call itself was refused
+ * or failed outright, no guest ever came into being on Proxmox: the DB row is pure debris,
+ * and worse than just clutter, since ProxMate's one scoped Proxmox account has no broader
+ * rights than whatever just refused it — an admin trying to delete that row later would
+ * hit the exact same refusal. Delete the row outright in that case. Only when the guest
+ * DOES exist (a later step, e.g. network/disk config, is what failed) is it left as
+ * 'error', same as always, so it can be inspected and removed the normal way.
+ */
+async function markVmErrorOrDeletePhantom(
+  vmId: string,
+  name: string,
+  node: string,
+  vmid: number,
+  client: Awaited<ReturnType<typeof pve.getClient>>,
+  err: unknown,
+  kind: pve.GuestKind = 'qemu',
+): Promise<void> {
+  if (await existsOnProxmox(node, vmid, client, kind)) {
+    await markVmError(vmId, name, err);
+    return;
+  }
+  await prisma.virtualMachine.delete({ where: { id: vmId } }).catch(() => undefined);
+  await notify({
+    event: 'vm.error',
+    title: name,
+    message: `"${name}" could not be created on Proxmox and was not provisioned: ${pve.pveMessage(err)}`,
+  }).catch(() => undefined);
+}
+
 /** Thrown when a VM request would push a user over one of their quota caps. */
 export class QuotaError extends Error {
   constructor(
@@ -85,6 +126,28 @@ export class CreateOptionError extends Error {
   ) {
     super(message);
     this.name = 'CreateOptionError';
+  }
+}
+
+/**
+ * Whether INSTALLING FROM AN ISO is restricted to admins on this server. A non-admin
+ * is otherwise offered every ISO on the configured ISO storage — with templates as the
+ * curated alternative, an operator may prefer tenants pick ONLY from those, and leave
+ * raw ISO installs (and the attack surface of an unattended OS installer) to admins.
+ * Off by default (`iso_admin_only` unset) — the classic behaviour, untouched.
+ *
+ * ONE function, read everywhere this matters (the route guard below, and `/auth/me`'s
+ * `isoInstallAllowed` the wizard hides the option on), so the two can't drift.
+ */
+export async function isIsoAdminOnly(): Promise<boolean> {
+  return (await getConfig('iso_admin_only')) === 'true';
+}
+
+/** Throws (admin-only) unless the actor is an admin or the restriction is off. */
+export async function assertMayInstallFromIso(actor: { role: string }): Promise<void> {
+  if (actor.role === 'admin') return;
+  if (await isIsoAdminOnly()) {
+    throw new CreateOptionError('Installing from an ISO is admin-only on this server — deploy from a template instead.');
   }
 }
 
@@ -220,7 +283,7 @@ export async function createVm(user: User, input: CreateVmInput): Promise<Virtua
     await pve.waitForTask(node, startUpid, client);
     return prisma.virtualMachine.update({ where: { id: vm.id }, data: { status: 'running' } });
   } catch (err) {
-    await markVmError(vm.id, input.name, err);
+    await markVmErrorOrDeletePhantom(vm.id, input.name, node, vmid, client, err);
     throw err;
   }
 }
@@ -360,7 +423,7 @@ export async function createContainer(user: User, input: CreateContainerInput): 
     await pve.waitForTask(node, startUpid, client);
     return prisma.virtualMachine.update({ where: { id: vm.id }, data: { status: 'running' } });
   } catch (err) {
-    await markVmError(vm.id, input.name, err);
+    await markVmErrorOrDeletePhantom(vm.id, input.name, node, vmid, client, err, 'lxc');
     throw err;
   }
 }
@@ -699,7 +762,7 @@ export async function deployFromTemplate(
       },
     });
   } catch (err) {
-    await markVmError(vm.id, input.name, err);
+    await markVmErrorOrDeletePhantom(vm.id, input.name, node, vmid, client, err);
     throw err;
   }
 }
@@ -796,7 +859,7 @@ export async function duplicateVm(source: VirtualMachine, newName: string): Prom
     await pve.waitForTask(node, startUpid, client);
     return prisma.virtualMachine.update({ where: { id: vm.id }, data: { status: 'running' } });
   } catch (err) {
-    await markVmError(vm.id, newName, err);
+    await markVmErrorOrDeletePhantom(vm.id, newName, node, vmid, client, err);
     throw err;
   }
 }
@@ -1311,9 +1374,15 @@ async function stopAndDeleteProxmoxVm(
   try {
     await pve.deleteVm(node, vmid, client, kind);
   } catch (err) {
-    // If the VM no longer exists on Proxmox, treat it as already deleted.
+    // If the VM no longer exists on Proxmox, treat it as already deleted. A plain
+    // "does not exist" is the common case; a permission denial on a guest ProxMate's
+    // scoped token can't even see (e.g. a create/clone that was refused before the
+    // guest ever joined its pool — see markVmErrorOrDeletePhantom) means the same
+    // thing in practice, so fall back to an existence check before giving up.
     const msg = pve.pveMessage(err);
-    if (!/does not exist|not found/i.test(msg)) throw err;
+    if (/does not exist|not found/i.test(msg)) return;
+    if (!(await existsOnProxmox(node, vmid, client, kind))) return;
+    throw err;
   }
 }
 

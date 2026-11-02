@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import bcrypt from 'bcryptjs';
+import { z } from 'zod';
 import { prisma } from '../lib/prisma.js';
 import { isSetupComplete, getConfig, setConfig } from './config.service.js';
 import { createSession } from './auth.service.js';
@@ -9,6 +10,7 @@ import {
   getNodes,
   getStorages,
   getBridges,
+  getSdnVnets,
   getEffectivePermissions,
   getClusterVmCount,
   heldPrivileges,
@@ -16,6 +18,31 @@ import {
 
 // Re-export config helpers so existing imports from setup.service keep working.
 export { isSetupComplete, getConfig, setConfig };
+
+/**
+ * The shape + validation rules for each OOBE step, SHARED between the interactive
+ * HTTP routes (setup.routes.ts) and the non-interactive `auto-setup` script
+ * (scripts/auto-setup.ts, env-var-driven). One definition means a password-strength
+ * rule (or any other future tightening) can't drift between the two paths.
+ */
+export const AdminSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8, 'Password must be at least 8 characters'),
+  displayName: z.string().min(1).max(100),
+});
+
+export const ProxmoxConfigSchema = z.object({
+  host: z.string().url('Must be a valid URL, e.g. https://192.168.1.100:8006'),
+  tokenId: z.string().min(1),
+  tokenSecret: z.string().min(1),
+  verifySsl: z.boolean().default(true),
+});
+
+export const DefaultsSchema = z.object({
+  storage: z.string().min(1),
+  bridge: z.string().min(1),
+  isoStorage: z.string().min(1),
+});
 
 // ─── Step 1: Create admin account ────────────────────────────
 
@@ -57,8 +84,13 @@ export async function createAdmin(data: {
 }
 
 export async function hasAdmin(): Promise<boolean> {
-  const admin = await prisma.user.findFirst({ where: { role: 'admin' } });
-  return !!admin;
+  return (await findAdmin()) !== null;
+}
+
+/** The first admin account, if any — just enough to tell "is this mine?" apart. */
+export async function findAdmin(): Promise<{ id: string; email: string } | null> {
+  const admin = await prisma.user.findFirst({ where: { role: 'admin' }, select: { id: true, email: true } });
+  return admin ?? null;
 }
 
 // ─── Step 2: Proxmox connection ───────────────────────────────
@@ -217,17 +249,29 @@ export async function getProxmoxResources(): Promise<{
   backupStorages: Array<{ name: string; type: string }>;
 }> {
   const client = await getClient();
-  const [storages, bridges] = await Promise.all([
+  // Classic Linux bridges AND SDN VNets both go in `net0: bridge=<name>` identically on
+  // the wire — a cluster that is entirely SDN-based (every guest network is a VNet, no
+  // vmbr0-style bridge) would otherwise show an empty bridge list here even though it
+  // has working networks. SDN failing to load (an older PVE with no SDN configured at
+  // all) must not take the classic-bridge list down with it.
+  const [storages, bridges, vnets] = await Promise.all([
     getStorages(client),
     getBridges(undefined, client),
+    getSdnVnets(client).catch(() => []),
   ]);
+  const bridgeNames = new Set(bridges.map((b) => b.iface));
 
   return {
     // Only storages that can hold VM disk images are valid disk pools.
     storages: storages
       .filter((s) => s.content?.includes('images'))
       .map((s) => ({ name: s.storage, type: s.type })),
-    bridges: bridges.map((b) => ({ name: b.iface })),
+    bridges: [
+      ...bridges.map((b) => ({ name: b.iface })),
+      // A VNet sharing a classic bridge's name would be a cluster misconfiguration, not
+      // a real second option — list it once.
+      ...vnets.filter((v) => !bridgeNames.has(v.vnet)).map((v) => ({ name: v.vnet })),
+    ],
     isoStorages: storages
       .filter((s) => s.content?.includes('iso'))
       .map((s) => ({ name: s.storage, type: s.type })),

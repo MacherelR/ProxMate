@@ -1,5 +1,4 @@
 import { Router, type Request, type Response } from 'express';
-import { z } from 'zod';
 import {
   isSetupComplete,
   createAdmin,
@@ -9,6 +8,9 @@ import {
   saveDefaults,
   completeSetup,
   hasAdmin,
+  AdminSchema,
+  ProxmoxConfigSchema,
+  DefaultsSchema,
 } from '../services/setup.service.js';
 import { setAuthCookies } from '../lib/cookies.js';
 import { authLimiter } from '../middleware/rate-limit.js';
@@ -48,12 +50,6 @@ router.use(async (_req: Request, res: Response, next) => {
 
 // ─── Step 1: Create admin account ────────────────────────────
 
-const AdminSchema = z.object({
-  email: z.string().email(),
-  password: z.string().min(8, 'Password must be at least 8 characters'),
-  displayName: z.string().min(1).max(100),
-});
-
 router.post('/admin', async (req: Request, res: Response) => {
   const parsed = AdminSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -71,13 +67,6 @@ router.post('/admin', async (req: Request, res: Response) => {
 });
 
 // ─── Step 2: Save Proxmox connection config ───────────────────
-
-const ProxmoxConfigSchema = z.object({
-  host: z.string().url('Must be a valid URL, e.g. https://192.168.1.100:8006'),
-  tokenId: z.string().min(1),
-  tokenSecret: z.string().min(1),
-  verifySsl: z.boolean().default(true),
-});
 
 router.post('/proxmox', async (req: Request, res: Response) => {
   const parsed = ProxmoxConfigSchema.safeParse(req.body);
@@ -119,12 +108,6 @@ router.get('/proxmox/resources', async (_req: Request, res: Response) => {
 });
 
 // ─── Step 3b: Save default VM settings ───────────────────────
-
-const DefaultsSchema = z.object({
-  storage: z.string().min(1),
-  bridge: z.string().min(1),
-  isoStorage: z.string().min(1),
-});
 
 router.post('/defaults', async (req: Request, res: Response) => {
   const parsed = DefaultsSchema.safeParse(req.body);

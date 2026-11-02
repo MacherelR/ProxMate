@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // The REAL proxmox.service request-builders (pickBestNode, createVm, isolation,
 // startVm) run against the fake axios below — that's the "integration" part.
 vi.mock('../../src/lib/prisma.js', () => ({
-  prisma: { virtualMachine: { create: vi.fn(), update: vi.fn(), findMany: vi.fn() } },
+  prisma: { virtualMachine: { create: vi.fn(), update: vi.fn(), findMany: vi.fn(), delete: vi.fn() } },
 }));
 vi.mock('../../src/services/config.service.js', () => ({ getConfig: vi.fn() }));
 vi.mock('../../src/services/proxmox.service.js', async (importOriginal) => {
@@ -21,6 +21,7 @@ import { GB } from '../helpers.js';
 const create = vi.mocked(prisma.virtualMachine.create);
 const update = vi.mocked(prisma.virtualMachine.update);
 const findMany = vi.mocked(prisma.virtualMachine.findMany);
+const del = vi.mocked(prisma.virtualMachine.delete);
 const getConfigMock = vi.mocked(getConfig);
 const getClientMock = vi.mocked(pve.getClient);
 
@@ -59,6 +60,7 @@ function fakePve() {
 beforeEach(() => {
   vi.clearAllMocks();
   getConfigMock.mockImplementation(async (k: string) => DEFAULTS[k] ?? null);
+  del.mockResolvedValue({} as never);
 });
 
 describe('createVm orchestration (vs mocked Proxmox API)', () => {
@@ -112,5 +114,63 @@ describe('createVm orchestration (vs mocked Proxmox API)', () => {
     expect(getClientMock).not.toHaveBeenCalled();
     expect(create).not.toHaveBeenCalled();
     expect(client.post).not.toHaveBeenCalled();
+  });
+
+  it('deletes the DB row when the create call is refused and no guest ever exists on Proxmox', async () => {
+    const client = fakePve();
+    const basePost = client.post;
+    client.post = vi.fn((url: string, ...args: unknown[]) => {
+      if (url === '/nodes/pve-int/qemu') {
+        return Promise.reject(new Error('Permission check failed (/pool/test, VM.Allocate)'));
+      }
+      return basePost(url, ...(args as []));
+    });
+    const baseGet = client.get;
+    client.get = vi.fn((url: string) => {
+      if (/\/nodes\/.+\/qemu\/\d+\/status\/current/.test(url)) {
+        return Promise.reject(new Error('no such VM'));
+      }
+      return baseGet(url);
+    });
+    getClientMock.mockResolvedValue(client as never);
+    create.mockResolvedValue({ id: 'db-1', status: 'creating', proxmoxVmId: 120, proxmoxNode: 'pve-int' } as never);
+
+    const admin = { id: 'a1', role: 'admin' } as never;
+    await expect(
+      createVm(admin, { name: 'web', cpu: 2, ram: 2048, storage: 20, os: 'debian.iso' }),
+    ).rejects.toThrow('Permission check failed');
+
+    // No guest exists on Proxmox under this vmid → the ghost DB row is removed outright,
+    // not left as an 'error' row nobody (not even an admin) could ever delete.
+    expect(del).toHaveBeenCalledWith({ where: { id: 'db-1' } });
+    expect(update).not.toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'error' } }));
+  });
+
+  it('marks the row \'error\' (does not delete it) when the guest DOES exist but a later step fails', async () => {
+    const client = fakePve();
+    const basePost = client.post;
+    client.post = vi.fn((url: string, ...args: unknown[]) => {
+      if (url === '/nodes/pve-int/qemu/120/status/start') {
+        return Promise.reject(new Error('Permission check failed (/vms/120, VM.PowerMgmt)'));
+      }
+      return basePost(url, ...(args as []));
+    });
+    const baseGet = client.get;
+    client.get = vi.fn((url: string) => {
+      if (/\/nodes\/.+\/qemu\/\d+\/status\/current/.test(url)) {
+        return Promise.resolve({ data: { data: { status: 'stopped' } } });
+      }
+      return baseGet(url);
+    });
+    getClientMock.mockResolvedValue(client as never);
+    create.mockResolvedValue({ id: 'db-1', status: 'creating', proxmoxVmId: 120, proxmoxNode: 'pve-int' } as never);
+
+    const admin = { id: 'a1', role: 'admin' } as never;
+    await expect(
+      createVm(admin, { name: 'web', cpu: 2, ram: 2048, storage: 20, os: 'debian.iso' }),
+    ).rejects.toThrow('Permission check failed');
+
+    expect(update).toHaveBeenCalledWith({ where: { id: 'db-1' }, data: { status: 'error' } });
+    expect(del).not.toHaveBeenCalled();
   });
 });

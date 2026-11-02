@@ -103,6 +103,7 @@ export default function SettingsPage() {
   const [savingDefaults, setSavingDefaults] = useState(false);
   // Non-admin users pick a pool / network / storage the Proxmox account can use.
   const [userPlacement, setUserPlacement] = useState(false);
+  const [isoAdminOnly, setIsoAdminOnly] = useState(false);
 
   // SMTP (email) — optional
   const [smtpHost, setSmtpHost] = useState("");
@@ -241,6 +242,7 @@ export default function SettingsPage() {
         setIsoStorage(defaults.isoStorage ?? "");
         setBackupStorage(defaults.backupStorage || BACKUP_AUTO);
         setUserPlacement(defaults.userPlacement === true);
+        setIsoAdminOnly(defaults.isoAdminOnly === true);
         if (res.data.smtp.configured) {
           const s = res.data.smtp;
           setSmtpHost(s.host);
@@ -340,6 +342,7 @@ export default function SettingsPage() {
         isoStorage,
         backupStorage: backupStorage === BACKUP_AUTO ? "" : backupStorage,
         userPlacement,
+        isoAdminOnly,
       });
       toast.success("Defaults saved.");
     } catch (err) {
@@ -669,6 +672,22 @@ export default function SettingsPage() {
                         and storage for each machine, and are offered only what that account can use —
                         the defaults above then apply to admins only. Rebuild and restore-from-upload
                         are unavailable to those users.
+                      </span>
+                    </span>
+                  </label>
+                  <label className="flex items-start gap-2 rounded-md border bg-muted/40 p-3 text-sm select-none">
+                    <input
+                      type="checkbox"
+                      checked={isoAdminOnly}
+                      onChange={(e) => setIsoAdminOnly(e.target.checked)}
+                      className="mt-0.5 size-4 rounded border-input accent-primary"
+                    />
+                    <span>
+                      <span className="font-medium">Only admins may install from ISO</span>
+                      <span className="block text-xs text-muted-foreground">
+                        Non-admin users won&apos;t see &quot;Custom VM (install from ISO)&quot; in the create
+                        wizard — only templates and containers. The API refuses it for them too, so this
+                        is a real restriction, not just a hidden button. Admins are unaffected.
                       </span>
                     </span>
                   </label>

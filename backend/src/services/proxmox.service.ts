@@ -647,6 +647,18 @@ export async function getIsos(storage?: string, client?: AxiosInstance): Promise
 
   const nodes = await getNodes(c);
   const seen = new Map<string, PveIso>();
+  // Genuine shared install media lives ONLY at `<storage>:iso/<file>` — the exact
+  // convention createVm() relies on when it attaches one (`ide2:
+  // ${isoStorage}:iso/${iso}`), and already used elsewhere in this file to recognize a
+  // real ISO attachment (see the `:iso/` check in getCloudInitDrives's neighbourhood).
+  // Proxmox's `content=iso` filter also returns GUEST-OWNED cdrom volumes on this
+  // storage — most commonly another VM's cloud-init seed, which is itself genuinely an
+  // ISO9660 image (a NoCloud datasource), so Proxmox classifies it as `content=iso` too,
+  // under a vmid-prefixed path like `<storage>:109/vm-109-cloudinit.qcow2`. Verified
+  // live: a shared ISO storage listed every other tenant's cloud-init seed alongside the
+  // real install media. Those are never something a tenant should be offered to install
+  // FROM, so anything outside the `iso/` shared-library path is excluded.
+  const isoPrefix = `${isoStorage}:iso/`;
 
   for (const { node } of nodes) {
     try {
@@ -654,6 +666,7 @@ export async function getIsos(storage?: string, client?: AxiosInstance): Promise
         `/nodes/${node}/storage/${isoStorage}/content?content=iso`,
       );
       for (const item of res.data.data) {
+        if (!item.volid.startsWith(isoPrefix)) continue;
         if (!seen.has(item.volid)) {
           seen.set(item.volid, {
             volid: item.volid,

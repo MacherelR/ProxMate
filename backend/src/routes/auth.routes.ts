@@ -37,6 +37,7 @@ import { recordAudit } from '../services/audit.service.js';
 import { isAccountLocked, registerFailedLogin, clearFailedLogins } from '../services/account-lockout.service.js';
 import { requestReset, resetWithToken } from '../services/password-reset.service.js';
 import { isScoped } from '../services/pve-scope.service.js';
+import { isIsoAdminOnly } from '../services/vm.service.js';
 import type { AuthRequest } from '../types/index.js';
 
 const router = Router();
@@ -393,6 +394,9 @@ router.get('/me', allowExpiredAccess, requireAuth, async (req: Request, res: Res
       // account can honour. Drives the wizard's placement pickers; the deploy routes
       // enforce it regardless.
       pveScoped: await isScoped(user),
+      // Whether the "install from ISO" wizard option is hidden for this account
+      // (admin-only server setting). The create route enforces this regardless.
+      isoInstallAllowed: user.role === 'admin' || !(await isIsoAdminOnly()),
       // Compute-access window. `accessExpiresAt: null` = never expires.
       // `accessExpired` is computed SERVER-side and is the only thing the UI may
       // trust to decide "expired" — a wrong client clock must not lock someone

@@ -48,5 +48,15 @@ if [ -n "${PROXMATE_MODULES:-}" ]; then
   node dist/scripts/migrate-modules.js
 fi
 
+# Non-interactive first-time setup (admin account, Proxmox connection, VM defaults)
+# from environment variables, instead of a human clicking through /setup. No-op unless
+# PROXMATE_AUTO_SETUP=true, and a permanent no-op again once setup is complete — see
+# the script's own doc comment for why it's safe to run unconditionally on every boot.
+#
+# No `|| true` here either, for the same reason as the module migrations above: a
+# misconfigured Proxmox token should abort the boot, not start a server stuck at the
+# OOBE wizard with nothing in the log explaining why.
+node dist/scripts/auto-setup.js
+
 echo "Starting ProxMate API…"
 exec node dist/index.js
