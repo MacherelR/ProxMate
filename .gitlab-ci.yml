@@ -1,0 +1,140 @@
+# Follows the house pattern used by rangezero
+# (ctc/infrastructure-tools/rangezero/.gitlab-ci.yml): Kaniko builds pushed to CTC's
+# internal Artifact Keeper registry, release-gated on a version tag.
+#
+# Two differences from that baseline, both intentional for ProxMate:
+#   - workflow rules also run on every plain branch push (not just MR/main/tag) — every
+#     commit on every branch gets a build-verify, not just MRs.
+#   - publish refuses to run unless the tagged commit is actually an ancestor of main,
+#     and unless PROXMATE_FQDN is set (verify-release stage, below).
+#
+# Requires (verify/set before the first real publish):
+#   - Group/project CI/CD variables CTC_ROOT_CA, ARTIFACTS_USER, ARTIFACTS_PASSWORD —
+#     rangezero's "infrastructure-tools" group already has these; "builds" may not.
+#   - Project CI/CD variable PROXMATE_FQDN — the FQDN baked into the published
+#     frontend bundle (see deploy/build_and_publish.sh's FQDN var for why).
+#   - Confirm ARTIFACTS_REPO below is actually the right Artifact Keeper repo for
+#     ProxMate's images — "infra-docker" is copied from rangezero's config as a
+#     starting guess, not verified against Artifact Keeper itself.
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - when: never
+
+stages:
+  - build-test
+  - verify-release
+  - publish
+
+variables:
+  ARTIFACT_HOST: artifacts.c.cybx.ch
+  ARTIFACTS_REPO: infra-docker
+
+.kaniko_base:
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+
+# ------------------------
+# Build-test — every commit, every branch: proves the image still builds. Not run
+# for tag pipelines (publish below does the real build for those).
+# ------------------------
+
+build-test:backend:
+  extends: .kaniko_base
+  stage: build-test
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+  script:
+    - /kaniko/executor
+        --context "${CI_PROJECT_DIR}/backend"
+        --dockerfile "${CI_PROJECT_DIR}/deploy/Dockerfile.backend.postgres"
+        --no-push
+
+build-test:frontend:
+  extends: .kaniko_base
+  stage: build-test
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+  script:
+    # FQDN is irrelevant here — never pushed, nobody consumes this baked value.
+    - /kaniko/executor
+        --context "${CI_PROJECT_DIR}/frontend"
+        --dockerfile "${CI_PROJECT_DIR}/frontend/Dockerfile"
+        --build-arg "NEXT_PUBLIC_API_URL=https://proxmate.example.com/api"
+        --build-arg "NEXT_PUBLIC_SITE_URL=https://proxmate.example.com"
+        --no-push
+
+# ------------------------
+# Publish — release-only: version tag (v1.2.3 or 1.2.3), tag must be on main, pushed
+# to Artifact Keeper.
+# ------------------------
+
+verify-release:
+  stage: verify-release
+  image: alpine/git
+  variables:
+    GIT_DEPTH: "0" # need full history to check ancestry against main
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v?\d+\.\d+\.\d+$/'
+  script:
+    - |
+      if [ -z "$PROXMATE_FQDN" ]; then
+        echo "PROXMATE_FQDN is not set (Settings > CI/CD > Variables) — refusing to bake a placeholder FQDN into a real release image." >&2
+        exit 1
+      fi
+    - git fetch origin main
+    - |
+      if ! git merge-base --is-ancestor "$CI_COMMIT_SHA" origin/main; then
+        echo "Refusing to publish: tag $CI_COMMIT_TAG points at $CI_COMMIT_SHA, which isn't on main." >&2
+        exit 1
+      fi
+
+.publish_base:
+  stage: publish
+  extends: .kaniko_base
+  needs: ["verify-release"]
+  before_script:
+    - mkdir -p /kaniko/ssl/certs
+    - cat /kaniko/ssl/certs/ca-certificates.crt > /kaniko/ca-certificates.crt || true
+    - echo "$CTC_ROOT_CA" >> /kaniko/ca-certificates.crt
+    - mv /kaniko/ca-certificates.crt /kaniko/ssl/certs/ca-certificates.crt
+    - mkdir -p /kaniko/.docker
+    - |
+      cat > /kaniko/.docker/config.json <<EOF
+      {
+        "auths": {
+          "${ARTIFACT_HOST}": {
+            "username": "${ARTIFACTS_USER}",
+            "password": "${ARTIFACTS_PASSWORD}"
+          }
+        }
+      }
+      EOF
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v?\d+\.\d+\.\d+$/'
+
+publish:backend:
+  extends: .publish_base
+  script:
+    - IMAGE="${ARTIFACT_HOST}/${ARTIFACTS_REPO}/proxmate-backend"
+    - /kaniko/executor
+        --context "${CI_PROJECT_DIR}/backend"
+        --dockerfile "${CI_PROJECT_DIR}/deploy/Dockerfile.backend.postgres"
+        --destination "${IMAGE}:${CI_COMMIT_TAG}"
+        --destination "${IMAGE}:latest"
+
+publish:frontend:
+  extends: .publish_base
+  script:
+    - IMAGE="${ARTIFACT_HOST}/${ARTIFACTS_REPO}/proxmate-frontend"
+    - /kaniko/executor
+        --context "${CI_PROJECT_DIR}/frontend"
+        --dockerfile "${CI_PROJECT_DIR}/frontend/Dockerfile"
+        --build-arg "NEXT_PUBLIC_API_URL=https://${PROXMATE_FQDN}/api"
+        --build-arg "NEXT_PUBLIC_SITE_URL=https://${PROXMATE_FQDN}"
+        --destination "${IMAGE}:${CI_COMMIT_TAG}"
+        --destination "${IMAGE}:latest"
