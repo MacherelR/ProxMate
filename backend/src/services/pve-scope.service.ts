@@ -143,7 +143,7 @@ interface Need {
 /** Every need must hold; otherwise ONE error names everything that's missing. */
 async function requireAll(needs: Need[], client: AxiosInstance): Promise<void> {
   const results = await Promise.all(needs.map((n) => privilegesAt(n.path, client)));
-  const missing = needs.filter((n, i) => !results[i]![n.priv]);
+  const missing = needs.filter((n, i) => !pve.holdsPriv(results[i], n.priv));
   if (missing.length > 0) {
     throw new ScopeError(
       `This environment's Proxmox account isn't allowed to ${missing
@@ -309,7 +309,11 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
  */
 export function treeMayHold(tree: pve.PvePermissions, path: string, priv: string): boolean {
   return Object.entries(tree).some(
-    ([key, privs]) => privs?.[priv] && (key === '/' || path === key || path.startsWith(`${key}/`)),
+    ([key, privs]) =>
+      path === key
+        ? pve.holdsPriv(privs, priv)
+        : // An ancestor's grant only reaches `path` when it propagates (value 1).
+          privs?.[priv] === 1 && (key === '/' || path.startsWith(`${key}/`)),
   );
 }
 
@@ -326,7 +330,7 @@ export async function getScopeOptions(
     throw new ScopeError(`Could not check what this environment may deploy: ${pve.pveMessage(err)}`, 502);
   });
 
-  const holds = async (path: string, priv: string) => !!(await privilegesAt(path, c))[priv];
+  const holds = async (path: string, priv: string) => pve.holdsPriv(await privilegesAt(path, c), priv);
   // A cluster object whose name Proxmox allows but our strict path check rejects is
   // simply not offered — it must not take the whole listing down with it.
   const pathOrNull = <T>(build: (t: T) => string, t: T): string | null => {

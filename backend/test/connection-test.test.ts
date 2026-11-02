@@ -173,8 +173,10 @@ describe('heldPrivileges', () => {
     expect([...held].sort()).toEqual(['Datastore.Audit', 'VM.Audit']);
   });
 
-  it('ignores privileges explicitly set to 0 rather than counting the key', () => {
-    expect(pve.heldPrivileges({ '/': { 'VM.Audit': 0 } }).size).toBe(0);
+  it('counts a privilege set to 0 — Proxmox uses the value for propagate, not for "held"', () => {
+    expect(pve.heldPrivileges({ '/storage/primary_01': { 'Datastore.AllocateSpace': 0 } })).toEqual(
+      new Set(['Datastore.AllocateSpace']),
+    );
   });
 
   it('is empty for an empty or absent map', () => {

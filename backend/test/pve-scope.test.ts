@@ -55,12 +55,14 @@ interface FakeOpts {
   broken?: boolean;
   /** Simulate a Proxmox that ignores `path` and returns the whole tree. */
   ignoresPath?: boolean;
+  /** Answer every privilege with 0 (held, not propagated) — what pool membership yields. */
+  unpropagated?: boolean;
 }
 
 /** A Proxmox whose account holds `grants[path] = [privileges]` and nothing else. */
 function fakePve(grants: Record<string, string[]>, opts: FakeOpts = {}) {
   const c = fakeClient();
-  const asPrivs = (p: string[]) => Object.fromEntries(p.map((x) => [x, 1]));
+  const asPrivs = (p: string[]) => Object.fromEntries(p.map((x) => [x, opts.unpropagated ? 0 : 1]));
   const tree = Object.fromEntries(Object.entries(grants).map(([k, v]) => [k, asPrivs(v)]));
   c.get.mockImplementation((url: string) => {
     if (url.startsWith('/access/permissions')) {
@@ -372,6 +374,34 @@ describe('treeMayHold', () => {
 
   it('honours a grant on the root', () => {
     expect(treeMayHold({ '/': { 'SDN.Use': 1 } }, '/sdn/zones/z/v', 'SDN.Use')).toBe(true);
+  });
+
+  it('counts a non-propagated grant (0) on the path itself, but not on its descendants', () => {
+    const pooled = { '/storage/primary_01': { 'Datastore.AllocateSpace': 0 } };
+    expect(treeMayHold(pooled, '/storage/primary_01', 'Datastore.AllocateSpace')).toBe(true);
+    expect(treeMayHold(pooled, '/storage/primary_01/x', 'Datastore.AllocateSpace')).toBe(false);
+  });
+});
+
+describe('pool-member grants (privilege value 0)', () => {
+  // Proxmox answers a privilege that reaches a storage or guest through POOL MEMBERSHIP
+  // with 0 (held, not propagated). Reading the value as a boolean once hid every
+  // pooled storage and template from confined users.
+  it('lets a placement through when every grant is unpropagated', async () => {
+    const c = fakePve(FULL_GRANTS, { unpropagated: true });
+    expect(await resolvePlacement(actor, REQ, TEMPLATE, asClient(c))).toEqual(REQ);
+  });
+
+  it('offers pooled storages and templates in the wizard', async () => {
+    findTemplates.mockResolvedValue([{ id: 't-ok', proxmoxVmId: 9001 }] as never);
+    const c = fakePve(FULL_GRANTS, {
+      unpropagated: true,
+      pools: ['delfino/delfino-02'],
+      storages: [{ storage: 'primary_01', type: 'rbd', content: 'images,rootdir' }],
+    });
+    const opts = await getScopeOptions(actor, asClient(c));
+    expect(opts?.storages.map((s) => s.name)).toEqual(['primary_01']);
+    expect(opts?.templateIds).toEqual(['t-ok']);
   });
 });
 

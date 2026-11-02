@@ -221,8 +221,17 @@ export async function getVersion(client?: AxiosInstance): Promise<string> {
   return res.data.data.version;
 }
 
-/** `{ '/': { 'VM.Audit': 1, … }, '/vms/100': { … } }` — path → privilege → 1. */
+/**
+ * `{ '/': { 'VM.Audit': 1, … }, '/vms/100': { 'VM.Clone': 0, … } }` — path → privilege →
+ * PROPAGATE flag. A listed privilege is held either way: 0 only means it doesn't
+ * propagate to child paths (every grant that comes from pool membership is 0).
+ */
 export type PvePermissions = Record<string, Record<string, number>>;
+
+/** Held at that path — a key's presence, never its value (0 is "held, not propagated"). */
+export function holdsPriv(privs: Record<string, number> | undefined, priv: string): boolean {
+  return privs?.[priv] !== undefined;
+}
 
 /**
  * The permissions the AUTHENTICATED entity actually holds, as Proxmox itself computes
@@ -287,7 +296,7 @@ export async function getSdnVnets(client?: AxiosInstance): Promise<PveVnet[]> {
 export function heldPrivileges(perms: PvePermissions): Set<string> {
   const out = new Set<string>();
   for (const privs of Object.values(perms ?? {})) {
-    for (const [priv, on] of Object.entries(privs ?? {})) if (on) out.add(priv);
+    for (const priv of Object.keys(privs ?? {})) out.add(priv);
   }
   return out;
 }
