@@ -33,6 +33,16 @@ variables:
   ARTIFACT_HOST: artifacts.c.cybx.ch
   ARTIFACTS_REPO: infra-docker
 
+default:
+  # Untagged jobs in the "builds" group land on a shell executor with no container
+  # support at all (image: is silently ignored there). "priv" is the Docker-executor
+  # pool other builds/* projects use for image-based jobs — see e.g.
+  # ctc/builds/neptune/.gitlab-ci.yml. Don't confuse this with docker-publish's
+  # "shell" tag, which deliberately runs the Docker CLI on the shell host itself
+  # instead of a container image — a different, unrelated pattern.
+  tags:
+    - priv
+
 .kaniko_base:
   image:
     name: gcr.io/kaniko-project/executor:debug
